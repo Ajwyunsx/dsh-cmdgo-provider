@@ -218,8 +218,8 @@ export function apply(ctx: Context, config: Config): void {
   // webServer 是可选服务且挂载顺序不受本插件控制：一次性 ctx.get 在冷启动时
   // 可能拿到 undefined 导致路由永远缺失（前端面板在、点登录却 404）。
   // 用 inject 回调：服务何时就绪何时注册，随 fiber 卸载自动撤销。
-  const installRoutes = (): void => {
-    const webServer = ctx.get('webServer') as {
+  const installRoutes = (sctx: Context): void => {
+    const webServer = sctx.get('webServer') as {
       register: (route: { kind: string; path: string; handler: (req: unknown, res: unknown) => void | Promise<void> }) => () => void
     } | undefined
     if (webServer === undefined) return
@@ -289,10 +289,12 @@ export function apply(ctx: Context, config: Config): void {
         }
       },
     }
-    ctx.effect(() => webServer.register(route))
+    // effect 必须挂在 inject 回调的作用域 ctx 上：挂外层 ctx 时 entry 移除
+    // 可能不触发本作用域的 disposer，路由就成了清不掉的孤儿（0.1.2 教训）。
+    sctx.effect(() => webServer.register(route))
   }
 
-  ctx.inject(['webServer'], () => { installRoutes() })
+  ctx.inject(['webServer'], (sctx) => { installRoutes(sctx) })
 
   // --- 供应商注册 ---
   const adapter = new CommandCodeGoAdapter({ options, resolveApiKey })
