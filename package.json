@@ -1,6 +1,6 @@
 {
   "name": "dsh-cmdgo-provider",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "CommandCode Go 套餐供应商：/alpha/generate CLI 网关接入 DSH 模型列表 + OAuth 登录（设置页 CommandCode Go 登录选项）",
   "type": "module",
   "main": "./lib/index.js",

@@ -215,11 +215,14 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // --- /api/cmdgo HTTP 路由（供客户端设置页调用） ---
-  const webServer = ctx.get('webServer') as {
-    register: (route: { kind: string; path: string; handler: (req: unknown, res: unknown) => void | Promise<void> }) => () => void
-  } | undefined
-
-  if (webServer !== undefined) {
+  // webServer 是可选服务且挂载顺序不受本插件控制：一次性 ctx.get 在冷启动时
+  // 可能拿到 undefined 导致路由永远缺失（前端面板在、点登录却 404）。
+  // 用 inject 回调：服务何时就绪何时注册，随 fiber 卸载自动撤销。
+  const installRoutes = (): void => {
+    const webServer = ctx.get('webServer') as {
+      register: (route: { kind: string; path: string; handler: (req: unknown, res: unknown) => void | Promise<void> }) => () => void
+    } | undefined
+    if (webServer === undefined) return
     const readJson = async (req: { on: (event: string, cb: (chunk?: Buffer) => void) => void }): Promise<Record<string, unknown>> => {
       const chunks: Buffer[] = []
       let size = 0
@@ -287,9 +290,9 @@ export function apply(ctx: Context, config: Config): void {
       },
     }
     ctx.effect(() => webServer.register(route))
-  } else {
-    ctx.logger.warn('[cmdgo] webServer 服务不存在，CommandCode Go 登录页面不可用（供应商本身不受影响）')
   }
+
+  ctx.inject(['webServer'], () => { installRoutes() })
 
   // --- 供应商注册 ---
   const adapter = new CommandCodeGoAdapter({ options, resolveApiKey })
