@@ -11,6 +11,21 @@ Command Code 的订阅分两种：
 
 本插件针对第二种情况。
 
+## 安装
+
+```sh
+# npm（推荐）
+dsh plugin --profile web add dsh-cmdgo-provider
+
+# 或从 GitHub 安装
+dsh plugin --profile web add github:Ajwyunsx/dsh-cmdgo-provider
+```
+
+安装写入 profile 的依赖与 bundles 列表，**重启 harness 后由 bundles 正常装配**。装完：
+
+1. 「Models」页选择 **Command Code Go** 供应商及模型；
+2. 「设置 → CommandCode Go」生成登录地址，浏览器授权后回调自动写入凭据。
+
 ## 功能
 
 - **供应商注册**：启动后自动从 `/provider/v1/models` 拉取模型目录并按 Go 套餐规则筛选（开源模型 + 少量 premium 例外），定时刷新；reasoning effort 从官方 CLI catalog 合并。装完即可在 Web「Models」页选择 **Command Code Go** 供应商。
@@ -32,5 +47,12 @@ Command Code 的订阅分两种：
 | `baseURL` | `https://api.commandcode.ai` | 网关 base URL |
 | `maxTokens` | `64000` | 单次输出上限 |
 | `defaultContextWindow` | `1000000` | 模型无精确上下文时的兜底 |
+
+## 排错
+
+- **装完不显示**：`dsh plugin add` 只写 profile 清单，运行中的 loader 需要重启（或热装配工具）才会加载；另外检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否残留同 id 的 `disabled: true` 条目——卸载器会写它阻断自装配，重装前应删除。
+- **模型列表为空**：目录来自 `https://api.commandcode.ai/provider/v1/models`（免鉴权），检查宿主网络；首次扫描失败会在日志告警并每 15 分钟重试。
+- **对话报 MISSING_CREDENTIAL**：先到「设置 → CommandCode Go」完成登录，或手动向 `~/.dsh/.credentials.yaml` 写入 `COMMANDCODE_API_KEY: user_xxxx`。
+- **回调收不到**：回调服务器绑定在宿主 `127.0.0.1:5959..5968`；若浏览器与宿主不同机，需保证 `localhost:<port>` 能回到宿主（端口转发/SSH 隧道）。
 
 > 非官方插件，仅限个人使用；请遵守 Command Code 服务条款。
