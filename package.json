@@ -1,0 +1,74 @@
+{
+  "name": "dsh-cmdgo-provider",
+  "version": "0.1.0",
+  "description": "CommandCode Go 套餐供应商：/alpha/generate CLI 网关接入 DSH 模型列表 + OAuth 登录（设置页 CommandCode Go 登录选项）",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "commandcode",
+    "commandcode-go",
+    "cmdgo",
+    "llm-provider",
+    "oauth"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1 <5",
+    "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.6 <0.2.0",
+    "@deepseek-ai/dsh-launch-environment": ">=0.1.0-rc.6 <0.2.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6 <0.2.0",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6 <0.2.0",
+    "@deepseek-ai/dsh-timeout": ">=0.1.0-rc.6 <0.2.0",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ajwyunsx/dsh-cmdgo-provider.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Ajwyunsx/dsh-cmdgo-provider/issues"
+  },
+  "homepage": "https://github.com/Ajwyunsx/dsh-cmdgo-provider#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}

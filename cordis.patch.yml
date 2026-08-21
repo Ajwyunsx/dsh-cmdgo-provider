@@ -1,0 +1,6 @@
+# dsh-cmdgo-provider bundle patch：插入 profile 装配层。
+# host 半边 = lib/index.js；client 半边由 package.json 的 dsh.client 声明装配
+# （lib/client.js，浏览器端注册 settings.section「CommandCode Go」登录面板）。
+- insert:
+    - id: cmdgo-provider
+      name: dsh-cmdgo-provider
