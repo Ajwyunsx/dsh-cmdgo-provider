@@ -7,7 +7,7 @@ CommandCode **Go 套餐**（$1/mo）供应商插件：把只能用 `cmd` CLI 的
 Command Code 的订阅分两种：
 
 1. **Provider API**：标准 OpenAI/Anthropic 兼容端点，任何 harness 可直连。
-2. **Go / GOAT / Pro 套餐**：调 Provider API 返回 `403 upgrade_required`，只能走 CLI 私有网关 `POST /alpha/generate`（自定义信封）。
+2. **Go 套餐**：调 Provider API 返回 `403 upgrade_required`，只能走 CLI 私有网关 `POST /alpha/generate`（自定义信封）。
 
 本插件针对第二种情况。
 
