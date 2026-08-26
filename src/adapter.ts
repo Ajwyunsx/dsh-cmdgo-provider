@@ -70,6 +70,22 @@ export interface CommandCodeGoAdapterOptions {
   options: () => CommandCodeGoConnectionOptions
   /** Resolve the bearer token for one request; throws `MISSING_CREDENTIAL` when unavailable. */
   resolveApiKey: () => Promise<string>
+  /** Account-pool size; bounds per-request failover attempts (default 1). */
+  poolSize?: () => number
+  /** The gateway accepted a request under this key — clear its failure bookkeeping. */
+  onKeySuccess?: (apiKey: string) => void | Promise<void>
+  /** A request failed on this key before the first byte — cool the account down. */
+  onKeyFailure?: (apiKey: string, message: string) => void | Promise<void>
+}
+
+/** Hard cap on same-request key failovers, even for very large pools. */
+const MAX_FAILOVER_ATTEMPTS = 4
+
+/** Error codes that justify switching to another account within one request. */
+const FAILOVER_CODES = new Set(['AUTH', 'RATE_LIMIT', 'SERVER', 'TRANSPORT'])
+
+function isFailoverError(error: unknown): boolean {
+  return error instanceof LlmError && FAILOVER_CODES.has(error.failure.code)
 }
 
 /** Default maximum idle interval while an adapter stream read is outstanding. */
@@ -170,9 +186,39 @@ export class CommandCodeGoAdapter extends LlmAdapter {
     })
   }
 
+  /**
+   * Stream one completion. With a pooled key resolver each attempt takes the
+   * next account; failures that occur before the first emitted chunk (auth,
+   * rate limit, server, transport) fail over to another account inside the
+   * same request. Once streaming has started, errors propagate unchanged —
+   * a half-delivered answer must never be silently replayed.
+   */
   async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const connection = this.config.options()
-    const apiKey = await this.config.resolveApiKey()
+    const attempts = Math.max(1, Math.min(this.config.poolSize?.() ?? 1, MAX_FAILOVER_ATTEMPTS))
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const apiKey = await this.config.resolveApiKey()
+      const mayFailover = attempt < attempts - 1
+      let yielded = false
+      try {
+        for await (const chunk of this.open(options, connection, apiKey)) {
+          yielded = true
+          yield chunk
+        }
+        return
+      } catch (error: unknown) {
+        if (yielded || !mayFailover || !isFailoverError(error)) throw error
+        this.fireKeyFailure(apiKey, error instanceof Error ? error.message : String(error))
+      }
+    }
+  }
+
+  /** One guarded upstream exchange: idle watchdog + request + event parse. */
+  private async * open(
+    options: GenerateOptions,
+    connection: CommandCodeGoConnectionOptions,
+    apiKey: string,
+  ): AsyncIterable<StreamChunk> {
     const consumer = new AbortController()
     const upstream = options.signal === undefined
       ? consumer.signal
@@ -219,6 +265,10 @@ export class CommandCodeGoAdapter extends LlmAdapter {
     }
   }
 
+  private fireKeyFailure(apiKey: string, message: string): void {
+    void Promise.resolve(this.config.onKeyFailure?.(apiKey, message)).catch(() => {})
+  }
+
   private async * request(
     options: GenerateOptions,
     signal: AbortSignal,
@@ -262,6 +312,8 @@ export class CommandCodeGoAdapter extends LlmAdapter {
         { status: response.status },
       )
     }
+    // 网关已接受该 key：清掉账号上的失败记账。
+    void Promise.resolve(this.config.onKeySuccess?.(apiKey)).catch(() => {})
     if (!response.body) {
       throw new LlmError('Command Code returned no response body', 'EMPTY_RESPONSE')
     }
