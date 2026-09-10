@@ -17,7 +17,6 @@
  * @module commandcode-go/protocol
  */
 
-import { CallId } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   FinishReason,
@@ -27,6 +26,15 @@ import type {
   ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import { platform, arch } from 'node:os'
+
+/**
+ * Brand carried by `StreamChunk`'s `tool-call-delta.id`. dsh-llm renamed the
+ * constructor from `CallId` (<= 0.1.1) to `ToolCallId` (>= 0.1.2); importing
+ * either statically makes the ESM link fail on the other host line. The brand
+ * is compile-time only (the constructor is the identity function), so we derive
+ * the type without naming the export and cast the raw string instead.
+ */
+type ToolCallChunkId = Extract<StreamChunk, { type: 'tool-call-delta' }>['id']
 
 /**
  * Gateway version pinned to a known-good Command Code CLI release. The gateway
@@ -275,7 +283,7 @@ export function eventToChunks(
       chunks.push({
         type: 'tool-call-delta',
         index: state.blockIndex,
-        id: CallId(callId),
+        id: callId as ToolCallChunkId,
         ...typeof event.toolName === 'string' ? { name: event.toolName } : {},
         argumentsDelta: JSON.stringify(input ?? {}),
       })
