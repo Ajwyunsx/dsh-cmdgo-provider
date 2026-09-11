@@ -33,7 +33,7 @@ dsh plugin --profile web add github:Ajwyunsx/dsh-cmdgo-provider
   1. 第一个选项是**登录地址**——点击「生成登录地址」，host 在 `127.0.0.1:5959..5968` 起本机回调服务器，拼出 `https://commandcode.ai/studio/auth/cli?callback=…&state=…`；
   2. 「打开登录页」→ 浏览器完成授权；
   3. Studio 页面 POST `{apiKey, state, userId, userName, keyName}` 回本机 `/callback`，state 校验通过后 API Key 自动写入凭据存储（默认 `COMMANDCODE_API_KEY`），面板显示等待回调 → 已登录。
-- **HTTP API**：`GET /api/cmdgo/status`、`POST /api/cmdgo/login|cancel|logout`。
+- **HTTP API**：`GET /api/cmdgo/status`、`POST /api/cmdgo/login|cancel|logout`、`POST /api/cmdgo/account/toggle|remove`、`POST /api/cmdgo/usage/refresh`。
 
 ## 多账号池（0.2.0+）
 
@@ -42,6 +42,26 @@ dsh plugin --profile web add github:Ajwyunsx/dsh-cmdgo-provider
 - **入池**：设置页每完成一次 OAuth 登录，新 key 自动成为池中一个独立账号（凭据存储按账号分 ref，清单在 `~/.dsh/cmdgo-accounts.json`）；重复登录同一 key 只刷新标签。升级无缝：既有单 key 自动收编为 `default` 账号。
 - **调度**：请求级 round-robin；某账号失败（401/403/429/5xx/传输错误）按指数冷却（30s 起，封顶 15min）并当次请求内自动切换下一账号（首字节前才允许换号，绝不重放半截回答）。网关接受即清除该账号失败计数。
 - **管理**：状态接口新增 `accounts` / `activeAccounts`；`POST /api/cmdgo/account/toggle|remove` 启停与移除单个账号，`/logout` 改为清空整个账号池。
+
+## 账号额度显示（0.5.0+）
+
+设置页每个账号下方展示该账号的实时额度，数据与官方 CLI 的 `/usage` 同源：
+
+| 行 | 含义 | 展示 |
+| --- | --- | --- |
+| `5H` | 5 小时滚动窗口 | 已用 / 上限、占用百分比、重置倒计时 |
+| `周` | 每周滚动窗口 | 同上 |
+| `月` | 月度额度 | 已用 / 套餐总额、账单日重置时间 |
+
+- 接口：`GET /alpha/billing/credits`（月度池 + 两个窗口 `{used, cap, exceeded, resetAt}`）、
+  `GET /alpha/billing/subscriptions`（套餐 id / 状态 / 账单周期）、`GET /alpha/whoami`（展示名）。
+- 套餐额度（月度总额）接口不返回，由 `planId` 或「5 小时 / 周上限」组合反查官方套餐表
+  （Go $10、GOAT $70、Pro $80、Max 10× $150、Max 20× $300、Team Pro $40）。
+- 顶部为套餐徽标与快照时间；占用 ≥70% 变黄、≥90% 变红；有按量购买的额外额度时单列一行
+  （额外额度不受滚动窗口限制）。读取失败时保留上一次数据并标注「上次刷新失败」。
+- **缓存**：按账号缓存 60s，`/status` 只读缓存并在后台补刷新，2.5s 的前端轮询不会打到网关；
+  「刷新额度」/「刷新全部额度」按钮走 `POST /api/cmdgo/usage/refresh` 立即拉取。
+- 池为空但主 ref 有 key 时，也展示一行只读的额度（无启停/移除按钮）。
 
 ## 协议实现
 

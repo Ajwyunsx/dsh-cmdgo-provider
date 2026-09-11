@@ -38,6 +38,14 @@ export interface PoolAccount {
   lastUsedAt?: number
 }
 
+/**
+ * 只需一个凭据引用即可解析 key：`keyOf` 不读账号的其它字段，
+ * 因此未入池的主 ref（合成展示行）也能复用同一条解析路径。
+ */
+export interface CredentialHolder {
+  ref: CredentialRef
+}
+
 interface Manifest {
   version: 1
   accounts: PoolAccount[]
@@ -67,6 +75,8 @@ export interface CredentialsSeam {
 export class AccountPool {
   private accounts: PoolAccount[] = []
   private loaded = false
+  /** 进行中的加载；并发调用共享同一个 promise，避免读到半载的清单。 */
+  private loading?: Promise<void>
   /** Round-robin cursor into the last usable ordering. */
   private cursor = 0
 
@@ -87,17 +97,24 @@ export class AccountPool {
   /** Load the manifest once; corrupt files start over (keys stay in the store). */
   private async ensureLoaded(): Promise<void> {
     if (this.loaded) return
-    this.loaded = true
-    try {
-      const raw = await readFile(this.file, 'utf8')
-      const parsed = JSON.parse(raw) as Partial<Manifest>
-      if (Array.isArray(parsed.accounts)) {
-        this.accounts = parsed.accounts.filter((a): a is PoolAccount =>
-          typeof a?.id === 'string' && typeof a?.ref === 'string' && typeof a?.addedAt === 'number')
+    // 并发调用必须等同一个加载完成：原先「先置 loaded 再 await」会让
+    // 第二个调用者看到空清单（冷启动首个 /status 报 0 个账号）。
+    if (this.loading !== undefined) return this.loading
+    this.loading = (async () => {
+      try {
+        const raw = await readFile(this.file, 'utf8')
+        const parsed = JSON.parse(raw) as Partial<Manifest>
+        if (Array.isArray(parsed.accounts)) {
+          this.accounts = parsed.accounts.filter((a): a is PoolAccount =>
+            typeof a?.id === 'string' && typeof a?.ref === 'string' && typeof a?.addedAt === 'number')
+        }
+      } catch (_missingOrCorrupt) {
+        this.accounts = []
       }
-    } catch (_missingOrCorrupt) {
-      this.accounts = []
-    }
+      this.loaded = true
+      this.loading = undefined
+    })()
+    return this.loading
   }
 
   private async persist(): Promise<void> {
@@ -138,7 +155,7 @@ export class AccountPool {
       const info = await credentials.describe(this.baseRef)
       if (!info.configured) return
       // 主 ref 的 key 若已与某个入池账号相同（老用户重新登录过），收编只会造成重复。
-      const legacyKey = await this.keyOf(credentials, { ref: this.baseRef } as PoolAccount)
+      const legacyKey = await this.keyOf(credentials, { ref: this.baseRef })
       if (legacyKey !== undefined) {
         for (const account of this.accounts) {
           const held = await this.keyOf(credentials, account)
@@ -217,7 +234,7 @@ export class AccountPool {
   }
 
   /** Resolve the API key of one account through the credential store. */
-  async keyOf(credentials: CredentialsSeam, account: PoolAccount): Promise<string | undefined> {
+  async keyOf(credentials: CredentialsSeam, account: CredentialHolder): Promise<string | undefined> {
     try {
       const hit = await credentials.resolve(account.ref)
       return hit !== undefined && hit.value.length > 0 ? hit.value : undefined

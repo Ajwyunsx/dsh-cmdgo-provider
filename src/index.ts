@@ -13,7 +13,9 @@
  *    服务器 + Studio 授权地址（登录地址），浏览器授权后自动回收 API Key
  *    并写入凭据存储（默认 COMMANDCODE_API_KEY）。
  * 3. 暴露 `/api/cmdgo/*` HTTP 路由供客户端「CommandCode Go」设置页调用：
- *    生成登录地址、等待回调状态、退出登录。
+ *    生成登录地址、等待回调状态、退出登录、账号启停/移除、额度刷新。
+ * 4. 通过与官方 CLI `/usage` 同源的账单接口读取每个账号的额度，在设置页
+ *    按账号展示 5 小时 / 周滚动窗口与月度额度（见 `usage.ts`）。
  *
  * @module cmdgo
  */
@@ -34,6 +36,8 @@ import { DEFAULT_STUDIO_BASE, CommandCodeLoginManager } from './oauth.js'
 import type { LoginSuccessInfo, LoginStatus } from './oauth.js'
 import { AccountPool } from './pool.js'
 import type { PoolAccount } from './pool.js'
+import { UsageReader } from './usage.js'
+import type { UsageStatus } from './usage.js'
 
 export {
   CommandCodeGoAdapter,
@@ -44,6 +48,16 @@ export type { CommandCodeGoAdapterOptions, CommandCodeGoConnectionOptions, Comma
 export { fetchCatalogEfforts, fetchGoModels, isGoModel, parseCatalogEfforts } from './models.js'
 export { CommandCodeLoginManager, DEFAULT_STUDIO_BASE } from './oauth.js'
 export type { LoginStatus, LoginSuccessInfo } from './oauth.js'
+export { UsageReader, normalizeUsage, resolvePlan } from './usage.js'
+export type {
+  PlanSpec,
+  UsageMonthly,
+  UsagePlanView,
+  UsageReaderOptions,
+  UsageSnapshot,
+  UsageStatus,
+  UsageWindow,
+} from './usage.js'
 
 export const name = 'dsh-cmdgo-provider'
 /** llm 是硬依赖（供应商路由）；webServer / credentials 可选，按需 ctx.get。 */
@@ -138,6 +152,43 @@ export function apply(ctx: Context, config: Config): void {
   adoptTimer.unref?.()
   ctx.effect(() => () => { clearInterval(adoptTimer) })
 
+  // --- 账号额度：5 小时 / 周滚动窗口 + 月度额度（官方 CLI `/usage` 同源接口）---
+  // 状态接口每 2.5s 被前端轮询一次，所以这里只读缓存、按 TTL 在后台补刷新，
+  // 保证 /status 永远不会被上游额度请求拖慢。
+  const usageReader = new UsageReader({
+    baseURL: () => options().baseURL,
+    log: (message) => { ctx.logger.info(message) },
+  })
+
+  /** 取账号的 API key；池账号与主 ref 通用（只用 account.ref）。 */
+  const accountKey = async (account: { ref: CredentialRef }): Promise<string | undefined> => {
+    const credentials = ctx.get('credentials')
+    if (credentials === undefined) return undefined
+    return pool.keyOf(credentials, account)
+  }
+
+  /** 即发即忘地补一次额度快照；TTL 内或已有请求在飞时直接跳过。 */
+  const refreshUsage = (account: { ref: CredentialRef }): void => {
+    if (!usageReader.stale(account.ref)) return
+    void accountKey(account).then((key) => {
+      if (key === undefined) {
+        usageReader.markMissing(account.ref)
+        return undefined
+      }
+      return usageReader.refresh(account.ref, key)
+    }).catch(() => { /* 失败原因已记录在 reader 里，UI 会显示 warning */ })
+  }
+
+  /** 强制刷新（设置页「刷新额度」），等待完成后返回。 */
+  const forceRefreshUsage = async (account: { ref: CredentialRef }): Promise<void> => {
+    const key = await accountKey(account)
+    if (key === undefined) {
+      usageReader.markMissing(account.ref)
+      return
+    }
+    await usageReader.refresh(account.ref, key, { force: true }).catch(() => {})
+  }
+
   const resolveApiKey = async (): Promise<string> => {
     const ref = currentRef()
     const credentials = ctx.get('credentials')
@@ -191,6 +242,8 @@ export function apply(ctx: Context, config: Config): void {
       }
       const account = await pool.add(credentials, info)
       ctx.logger.info(`[cmdgo] API key 已入池 ${account.ref}${info.userName === undefined ? '' : `（user=${info.userName}）`}`)
+      // 新账号立即拉一次额度，设置页无需等待 TTL。
+      void forceRefreshUsage(account)
     } catch (error) {
       ctx.logger.error('[cmdgo] 凭据写入失败')
       ctx.logger.error(error)
@@ -234,6 +287,10 @@ export function apply(ctx: Context, config: Config): void {
       cooling: boolean
       lastError?: string
       configured: boolean
+      /** 池为空时为主 ref 的只读展示行（不可启停/移除）。 */
+      synthetic?: boolean
+      /** 该账号的额度快照；首次轮询时可能尚未就绪。 */
+      usage?: UsageStatus
     }>
   }> {
     const ref = currentRef()
@@ -248,11 +305,17 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
     const now = Date.now()
-    const rows = await Promise.all((await pool.list()).map(async (account: PoolAccount) => {
+    const pooled = await pool.list()
+    // 池为空但主 ref 有 key 时也展示一行：升级用户在被收编前同样能看到额度。
+    const listed: Array<PoolAccount & { synthetic?: boolean }> = pooled.length > 0
+      ? pooled
+      : (configured ? [{ id: 'default', ref, addedAt: 0, enabled: true, failCount: 0, synthetic: true }] : [])
+    const rows = await Promise.all(listed.map(async (account) => {
       let accountConfigured = false
       if (credentials !== undefined) {
         try { accountConfigured = (await credentials.describe(account.ref)).configured } catch (_describeFailure) { /* 视为缺失 */ }
       }
+      refreshUsage(account)
       return {
         id: account.id,
         ref: account.ref,
@@ -264,6 +327,8 @@ export function apply(ctx: Context, config: Config): void {
         cooling: (account.cooldownUntil ?? 0) > now,
         ...(account.lastError === undefined ? {} : { lastError: account.lastError }),
         configured: accountConfigured,
+        ...(account.synthetic === true ? { synthetic: true } : {}),
+        usage: usageReader.snapshot(account.ref),
       }
     }))
     return {
@@ -361,6 +426,17 @@ export function apply(ctx: Context, config: Config): void {
             sendJson(rawRes, removed ? 200 : 404, removed
               ? { ok: true }
               : { ok: false, error: '账号不存在' })
+            return
+          }
+          if (req.method === 'POST' && action === '/usage/refresh') {
+            const body = await readJson(req)
+            const id = typeof body.id === 'string' ? body.id : ''
+            const pooled = await pool.list()
+            const targets = id.length > 0 ? pooled.filter((a) => a.id === id) : pooled
+            // 池为空时刷新主 ref（与 /status 的合成行对应）。
+            const accounts: Array<{ ref: CredentialRef }> = targets.length > 0 ? targets : [{ ref: currentRef() }]
+            await Promise.all(accounts.map((account) => forceRefreshUsage(account)))
+            sendJson(rawRes, 200, { ok: true, refreshed: accounts.length })
             return
           }
           if (req.method === 'POST' && action === '/logout') {
