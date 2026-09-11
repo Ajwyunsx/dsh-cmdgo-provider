@@ -15,10 +15,10 @@ Command Code 的订阅分两种：
 
 ```sh
 # npm（推荐）
-dsh plugin --profile web add dsh-cmdgo-provider
+dsh plugin add dsh-cmdgo-provider
 
 # 或从 GitHub 安装
-dsh plugin --profile web add github:Ajwyunsx/dsh-cmdgo-provider
+dsh plugin add github:Ajwyunsx/dsh-cmdgo-provider
 ```
 
 安装写入 profile 的依赖与 bundles 列表，**重启 harness 后由 bundles 正常装配**。装完：
