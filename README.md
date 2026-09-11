@@ -133,6 +133,26 @@ DSH 运行期间打开一个恶意页面，它就能静默调用：
 
 ## 排错
 
+- **报 `Command Code stream ended without finish-step`**：0.6.3 前这个报错几乎总是
+  **掩盖了真正的原因**。网关的终止事件不止 `finish-step`：
+
+  | 事件 | 含义 | 0.6.3 前的行为 |
+  | --- | --- | --- |
+  | `finish-step` | 正常结束 | 正常返回 |
+  | `finish` | 整条流正常结束 | **被忽略 → 误报截断** |
+  | `error` | 网关报错（如 `Tool result is missing for tool call …`） | **被忽略 → 误报截断** |
+  | `abort` | 网关中止 | **被忽略 → 误报截断** |
+
+  实测复现：assistant 消息带 `tool-call` 却没有对应工具结果时，网关返回
+  `{"type":"error","error":{"type":"server_error","message":"Tool result is missing for tool call call_x."}}`
+  且不带 `finish-step` —— 用户看到的却是 "without finish-step"。
+
+  0.6.3 起：`error`/`abort` 会带出**真实原因**，`finish` 也当正常终态；
+  另外序列化时会**丢弃没有对应结果的孤儿工具调用**（长会话被压缩、工具执行被
+  中断时常见），从源头避免这类请求。真截断仍报 `STREAM_CLOSED`，但会带上收到的
+  事件数便于诊断。错误分类为 `INVALID_REQUEST` 的请求**不会**触发账号故障转移，
+  避免拿一个必然失败的请求去烧其它账号的额度。
+
 - **装完不显示**：`dsh plugin add` 只写 profile 清单，运行中的 loader 需要重启（或热装配工具）才会加载；另外检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否残留同 id 的 `disabled: true` 条目——卸载器会写它阻断自装配，重装前应删除。
 - **模型列表为空（显示 0）**：目录来自 `https://api.commandcode.ai/provider/v1/models`（免鉴权）。
   冷启动时网络可能尚未就绪，因此首扫失败会按 **3s → 10s → 30s → 60s** 快速退避重试，

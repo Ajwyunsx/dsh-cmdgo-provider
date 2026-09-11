@@ -168,7 +168,16 @@ function toolResultOutput(
     : { type: 'text', value: value || '(no output)' }
 }
 
-function serializeAssistant(message: Message): Extract<CcMessage, { role: 'assistant' }> {
+/**
+ * 序列化一条 assistant 消息。
+ *
+ * `resultIds` 是本轮所有工具结果的 id 集合：**没有对应结果的工具调用必须丢掉**。
+ * 网关对「有 tool-call 却没有对应 tool 结果」是硬错误——实测返回
+ * `{"type":"error","error":{"type":"server_error","message":"Tool result is missing for tool call …"}}`
+ * 且不带 finish-step。长时间会话被压缩、或工具执行被中断时，历史里很容易出现这种
+ * 孤儿调用；丢掉它比让整轮失败好。
+ */
+function serializeAssistant(message: Message, resultIds?: ReadonlySet<string>): Extract<CcMessage, { role: 'assistant' }> | undefined {
   const parts: Extract<CcMessage, { role: 'assistant' }>['content'] = []
   for (const block of message.content) {
     if (block.type === 'text') {
@@ -176,6 +185,7 @@ function serializeAssistant(message: Message): Extract<CcMessage, { role: 'assis
     } else if (block.type === 'reasoning') {
       parts.push({ type: 'reasoning', text: block.text })
     } else if (block.type === 'tool-call') {
+      if (resultIds !== undefined && !resultIds.has(block.id)) continue
       parts.push({
         type: 'tool-call',
         toolCallId: block.id,
@@ -184,7 +194,24 @@ function serializeAssistant(message: Message): Extract<CcMessage, { role: 'assis
       })
     }
   }
+  // 整条消息只剩被丢掉的孤儿工具调用时，空 assistant 消息同样会被网关拒绝。
+  if (parts.length === 0) return undefined
   return { role: 'assistant', content: parts }
+}
+
+/** 收集全部工具结果的 toolCallId（含嵌在 tool-result 内容里的）。 */
+function collectToolResultIds(messages: readonly Message[]): Set<string> {
+  const ids = new Set<string>()
+  const walk = (blocks: readonly ContentBlock[]): void => {
+    for (const block of blocks) {
+      if (block.type === 'tool-result') {
+        ids.add(block.toolCallId)
+        walk(block.content)
+      }
+    }
+  }
+  for (const message of messages) walk(message.content)
+  return ids
 }
 
 function safeParseJson(raw: string): unknown {
@@ -290,13 +317,16 @@ export async function buildRequest(
 ): Promise<CcRequestEnvelope> {
   let system = options.system ?? ''
   const messages: CcMessage[] = []
+  // 先扫一遍工具结果：孤儿工具调用会被 drop（见 serializeAssistant）。
+  const resultIds = collectToolResultIds(options.messages)
   for (const message of options.messages) {
     if (message.role === 'system') {
       system += (system ? '\n\n' : '') + flattenText(message.content)
       continue
     }
     if (message.role === 'assistant') {
-      messages.push(serializeAssistant(message))
+      const serialized = serializeAssistant(message, resultIds)
+      if (serialized !== undefined) messages.push(serialized)
       continue
     }
     messages.push(...await serializeUser(message, resolveImage))
@@ -343,13 +373,70 @@ export async function buildRequest(
   }
 }
 
+/** 事件流状态：块下标 + 是否已产出终态 finish。 */
+export interface CcStreamState {
+  blockIndex: number
+  /** 已产出 finish 块（finish-step 或 finish 都可能先到，只认第一个）。 */
+  finished?: boolean
+}
+
+/**
+ * Extract the human message from a gateway stream error part.
+ *
+ * The gateway does NOT use the AI SDK's plain `errorText` shape here — the
+ * observed form is `{"type":"error","error":{"type":"server_error","message":"…"}}`.
+ * Both, plus a bare `message`, are handled so the real cause is never lost.
+ *
+ * @returns the message, or undefined when the part carries none.
+ */
+export function streamErrorText(event: CcStreamEvent): string | undefined {
+  const direct = event.errorText ?? event.message
+  if (typeof direct === 'string' && direct.length > 0) return direct
+  const nested = event.error
+  if (typeof nested === 'string' && nested.length > 0) return nested
+  if (isRecord(nested)) {
+    for (const key of ['message', 'errorText', 'detail'] as const) {
+      const value = nested[key]
+      if (typeof value === 'string' && value.length > 0) return value
+    }
+    // 再嵌一层（如 {error:{error:{message}}}）。
+    const deeper = nested.error
+    if (isRecord(deeper) && typeof deeper.message === 'string' && deeper.message.length > 0) {
+      return deeper.message
+    }
+  }
+  return undefined
+}
+
+/**
+ * Map a gateway stream error part to a stable harness failure code.
+ *
+ * Request-shape faults ("Tool result is missing", invalid parameters) must NOT
+ * be classified as failover-worthy: retrying them on another account only
+ * burns quota on a request that can never succeed.
+ */
+export function streamErrorCode(event: CcStreamEvent, message: string): string {
+  const text = message.toLowerCase()
+  if (/tool result is missing|invalid|malformed|unsupported|required|must be|too (long|large)/.test(text)) {
+    return 'INVALID_REQUEST'
+  }
+  if (/rate ?limit|quota|too many requests|usage limit|exceeded/.test(text)) return 'RATE_LIMIT'
+  if (/unauthor|forbidden|invalid api key|expired/.test(text)) return 'AUTH'
+  if (/context|token limit|too many tokens/.test(text)) return 'CONTEXT_WINDOW_EXCEEDED'
+  if (/overload|unavailable|internal|server error|timeout|upstream/.test(text)) return 'SERVER'
+  const kind = isRecord(event.error) && typeof event.error.type === 'string' ? event.error.type.toLowerCase() : ''
+  if (kind.includes('server')) return 'SERVER'
+  if (kind.includes('auth')) return 'AUTH'
+  return 'SERVER'
+}
+
 /**
  * Translate one gateway stream event into one or more harness StreamChunks.
  * @returns an empty array when the event has no harness representation.
  */
 export function eventToChunks(
   event: CcStreamEvent,
-  state: { blockIndex: number },
+  state: CcStreamState,
 ): StreamChunk[] {
   const chunks: StreamChunk[] = []
   switch (event.type) {
@@ -389,8 +476,16 @@ export function eventToChunks(
       })
       break
     }
-    case 'finish-step': {
-      const usage = isRecord(event.usage) ? event.usage as unknown as CcUsage : undefined
+    // finish-step 是每个 step 的终态；finish 是整条流的终态。正常情况两者都到，
+    // 但网关在某些路由/错误路径下只发 finish，因此两者都当终态处理，且只认第一个
+    // ——否则一条完整的回答会因为缺 finish-step 被判成截断而整轮失败。
+    case 'finish-step':
+    case 'finish': {
+      if (state.finished === true) break
+      state.finished = true
+      const usage = isRecord(event.usage)
+        ? event.usage as unknown as CcUsage
+        : isRecord(event.totalUsage) ? event.totalUsage as unknown as CcUsage : undefined
       if (usage) {
         const inputDetails = isRecord(usage.inputTokenDetails) ? usage.inputTokenDetails : undefined
         const outputDetails = isRecord(usage.outputTokenDetails) ? usage.outputTokenDetails : undefined
@@ -413,6 +508,11 @@ export function eventToChunks(
       }
       const reason = event.finishReason ?? event.rawFinishReason ?? 'stop'
       chunks.push({ type: 'finish', reason: mapFinishReason(reason) })
+      break
+    }
+    // error / abort 由适配器转成 LlmError（要带上真实原因），这里不产出 chunk。
+    case 'error':
+    case 'abort': {
       break
     }
   }

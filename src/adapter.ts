@@ -32,8 +32,8 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
-import { buildRequest, CC_VERSION, DEFAULT_MAX_TOKENS, eventToChunks, gatewayErrorMessage, parseEventStream } from './protocol.js'
-import type { ImageResolver } from './protocol.js'
+import { buildRequest, CC_VERSION, DEFAULT_MAX_TOKENS, eventToChunks, gatewayErrorMessage, parseEventStream, streamErrorCode, streamErrorText } from './protocol.js'
+import type { CcStreamState, ImageResolver } from './protocol.js'
 import type { ModelInputModality } from './models.js'
 
 /** One catalog model advertised by the adapter. */
@@ -359,18 +359,43 @@ export class CommandCodeGoAdapter extends LlmAdapter {
       throw new LlmError('Command Code returned no response body', 'EMPTY_RESPONSE')
     }
 
-    const state = { blockIndex: 0 }
+    const state: CcStreamState = { blockIndex: 0 }
+    let eventCount = 0
+    let sawError = false
     for await (const event of parseEventStream(response.body)) {
+      eventCount += 1
+      // 网关的 error / abort 是流的真实终止原因。此前它们被忽略，于是流一结束就
+      // 报「stream ended without finish-step」，把真正的错误（例如
+      // "Tool result is missing for tool call …"）盖掉了。
+      if (event.type === 'error') {
+        sawError = true
+        const message = streamErrorText(event) ?? 'unknown gateway error'
+        throw new LlmError(
+          `Command Code gateway error: ${message} [model=${options.model}]`,
+          streamErrorCode(event, message),
+        )
+      }
+      if (event.type === 'abort') {
+        sawError = true
+        throw new LlmError('Command Code gateway aborted the stream', 'ABORTED')
+      }
       // Each distinct content stream (text / reasoning / tool-call) opens its
       // own block index in arrival order.
       if (event.type === 'text-start' || event.type === 'reasoning-start' || event.type === 'tool-call') {
         state.blockIndex += 1
       }
       yield* eventToChunks(event, state)
-      if (event.type === 'finish-step') return
+      // finish-step 或 finish 任一到达都表示本轮已正常结束。
+      if (state.finished === true) return
     }
-    // Gateway closed without a finish-step: treat as truncated.
-    throw new LlmError('Command Code stream ended without finish-step', 'STREAM_CLOSED')
+    // Stream ended with no terminal marker at all: genuinely truncated. Report
+    // enough context to tell a silent close from a mis-parsed body.
+    throw new LlmError(
+      sawError
+        ? 'Command Code stream ended right after an error event'
+        : `Command Code stream ended without finish-step or finish (${eventCount} event(s) received)`,
+      'STREAM_CLOSED',
+    )
   }
 }
 
