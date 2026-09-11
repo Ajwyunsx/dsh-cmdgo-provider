@@ -38,6 +38,8 @@ import { AccountPool } from './pool.js'
 import type { PoolAccount } from './pool.js'
 import { UsageReader } from './usage.js'
 import type { UsageStatus } from './usage.js'
+import { applyModalities, fetchCatalogModalities, hasKnownModality } from './models.js'
+import type { ImageResolver } from './protocol.js'
 
 export {
   CommandCodeGoAdapter,
@@ -71,6 +73,33 @@ const DEFAULT_API_KEY_ENV = 'COMMANDCODE_API_KEY'
 const DEFAULT_BASE_URL = 'https://api.commandcode.ai'
 /** 目录扫描周期；模型列表稳定，慢轮询足够。 */
 const REFRESH_MS = 15 * 60 * 1000
+
+/** 请求图像投影预算（与 dsh 内置 provider 同量级：0.64 MP / 1 MiB）。 */
+const DEFAULT_REQUEST_IMAGE_PIXELS = 640_000
+const DEFAULT_REQUEST_IMAGE_BYTES = 1024 * 1024
+/** 实时模态注册表最多多久重拉一次（2.5 MB，只在目录出现未知模型时才拉）。 */
+const MODALITY_REFRESH_MS = 6 * 60 * 60 * 1000
+
+/**
+ * 附件服务的结构契约。只用到读取请求图像这一个方法，因此按结构声明而不是
+ * 新增 peer 依赖（`attachments` 是可选服务，缺席时图片降级为占位文字）。
+ * `ctx.get()` 的返回类型是 any，所以这里显式断言，避免接口沦为死代码。
+ */
+interface ImageAttachmentRefLike {
+  attachmentId: string
+  mediaType: string
+  bytes: number
+  width: number
+  height: number
+}
+
+interface ImageAttachmentService {
+  readImageRequest(
+    ref: ImageAttachmentRefLike,
+    policy: { maxPixels: number; maxBytes: number },
+    signal: AbortSignal | undefined,
+  ): Promise<{ data: Uint8Array; mediaType: string }>
+}
 
 /**
  * 插件配置：同时作为 Models 页里该供应商的设置区块形状。
@@ -468,9 +497,26 @@ export function apply(ctx: Context, config: Config): void {
     if (credentials === undefined) return undefined
     return pool.findByKey(credentials, apiKey)
   }
+  // --- 图像输入：把 harness 的附件引用解析成网关要的 data URL ---
+  // 附件服务是可选的：没有它时适配器会把图片降级成占位文字，绝不静默丢图。
+  const requestImageEncoding = { maxPixels: DEFAULT_REQUEST_IMAGE_PIXELS, maxBytes: DEFAULT_REQUEST_IMAGE_BYTES }
+
+  /** 读取一份附件的请求版本并编码成 `data:<mediaType>;base64,<bytes>`。 */
+  const resolveImage: ImageResolver = async (block) => {
+    const attachments = ctx.get('attachments') as ImageAttachmentService | undefined
+    if (attachments === undefined) return undefined
+    const projected = await attachments.readImageRequest(
+      block.attachment,
+      requestImageEncoding,
+      undefined,
+    )
+    return `data:${projected.mediaType};base64,${Buffer.from(projected.data).toString('base64')}`
+  }
+
   const adapter = new CommandCodeGoAdapter({
     options,
     resolveApiKey,
+    resolveImage,
     poolSize: () => Math.max(1, pool.size),
     onKeySuccess: async (apiKey) => {
       const account = await accountForKey(apiKey)
@@ -512,12 +558,36 @@ export function apply(ctx: Context, config: Config): void {
     refreshTimer = undefined
   })
 
+  // 实时模态注册表：离线快照没见过的模型才去拉（2.5 MB），且最多 6 小时一次。
+  let liveModalities: Map<string, string[]> | undefined
+  let modalityAttemptAt = 0
+
+  /**
+   * 补齐离线快照里没有的模型模态。目录里全是已知 id 时零网络开销；
+   * 失败按同样的时间窗退避，不会每次 sync 重试拖慢目录刷新。
+   */
+  async function ensureModalities(ids: readonly string[]): Promise<Map<string, string[]> | undefined> {
+    const unknown = ids.filter((id) => !hasKnownModality(id) && liveModalities?.get(id) === undefined)
+    if (unknown.length === 0) return liveModalities
+    if (Date.now() - modalityAttemptAt < MODALITY_REFRESH_MS) return liveModalities
+    modalityAttemptAt = Date.now()
+    try {
+      liveModalities = await fetchCatalogModalities()
+      ctx.logger.info('[cmdgo] 已同步实时模态注册表（%d 条）：%s', liveModalities.size, unknown.join(', '))
+    } catch (error) {
+      ctx.logger.warn('[cmdgo] 模态注册表拉取失败（沿用离线快照）: %s', error instanceof Error ? error.message : String(error))
+    }
+    return liveModalities
+  }
+
   /** 扫描 Go 目录并换入 adapter 视图。 */
   async function sync(): Promise<void> {
     const entries = await fetchGoModels()
     if (entries.length === 0) {
       throw new Error('no Go models found; keeping the previous catalog')
     }
+    const live = await ensureModalities(entries.map(entry => entry.id))
+    const withModalities = live === undefined ? entries : applyModalities(entries, live)
     // effort 元数据尽力而为：目录抖动不能拖垮模型列表。
     let efforts = new Map<string, string[]>()
     try {
@@ -525,15 +595,17 @@ export function apply(ctx: Context, config: Config): void {
     } catch (error) {
       ctx.logger.warn('[cmdgo] effort catalog scan failed: %s', error instanceof Error ? error.message : String(error))
     }
-    const next = entries.map(entry => ({
+    const next = withModalities.map(entry => ({
       id: entry.id,
       name: entry.name,
       contextWindow: entry.contextWindow,
+      inputModalities: entry.inputModalities,
       ...(efforts.get(entry.id) === undefined ? {} : { efforts: efforts.get(entry.id)! }),
     }))
     if (deepEqualJson(next, scanned)) return
     scanned = next
-    ctx.logger.info('[cmdgo] synced %d Go model(s): %s', next.length, next.map(m => m.id).join(', '))
+    const visionCount = next.filter(m => m.inputModalities?.includes('image')).length
+    ctx.logger.info('[cmdgo] synced %d Go model(s)（%d 个支持图像）: %s', next.length, visionCount, next.map(m => m.id).join(', '))
   }
 
   void sync().catch((error: unknown) => {

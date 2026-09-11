@@ -63,6 +63,35 @@ dsh plugin --profile web add github:Ajwyunsx/dsh-cmdgo-provider
   「刷新额度」/「刷新全部额度」按钮走 `POST /api/cmdgo/usage/refresh` 立即拉取。
 - 池为空但主 ref 有 key 时，也展示一行只读的额度（无启停/移除按钮）。
 
+## 多模态 / 图像输入（0.6.0+）
+
+支持视觉的模型现在会被正确标记，图片可以真正送达模型。
+
+**为什么之前不行**：适配器把每个模型的 `inputModalities` 硬编码成 `['text']`。
+harness 见到「声明了模态且不含 image」就会把图片换成占位文字
+（`projectImagesForTextModel`），所以图片根本没到网关。
+
+**模态从哪来**：`/provider/v1/models` 不返回模态，而 models.md 的 “Best for” 文案
+**不能**当判据——交叉核对 70 行里有 39 行不一致（Claude / GPT / Qwen 明明支持图像却只字未提）。
+唯一权威来源是官方 CLI 自带模型注册表的 `inputModalities` 字段（CLI 自己就是靠它决定要不要剥图）：
+
+- **离线快照**：`KNOWN_MODALITIES`（74 条，生成自 `command-code@1.53.0`），零网络开销即可覆盖当前目录。
+- **实时补齐**：只有当目录里出现快照没见过的模型时才去拉 CLI bundle（约 2.5 MB）解析，
+  且最多 6 小时一次、失败同样退避；目录命中快照时完全不发请求。
+- 都查不到时按纯文本处理——宁可让 harness 换成占位文字，也不误报能力。
+
+**传输**：图片按官方 CLI 的网关形态发送——`{type:'image', image:'data:<mime>;base64,…'}`
+（不是 Anthropic 的 `source` 包装；网关会把它归一化成 `{type:'file', mediaType, data}`）。
+harness 的图像块是附件引用，因此经 `attachments.readImageRequest(ref, {maxPixels: 640000, maxBytes: 1 MiB})`
+取请求版本再编码；附件服务缺席或读取失败时降级为显式占位文字，**绝不静默丢图**。
+工具结果里内嵌的图片按 harness 自己的递归口径取出，跟在 tool 消息后以单独一条 user 消息发送。
+
+**实测**：`moonshotai/Kimi-K2.5`、`Qwen/Qwen3.8-Flash` 对 6 种纯色图 6/6 正确识别。
+当前 43 个 Go 模型里 23 个支持图像。
+
+> 注意：`deepseek/deepseek-v4.1-flash` 在注册表里标记为支持图像，但实测对纯色图识别错误
+> （5/5 失败），疑似网关侧路由到了纯文本部署。插件按注册表声明能力，不单独改写。
+
 ## 协议实现
 
 请求信封与流式解析对齐官方 CLI（`x-command-code-version`、NDJSON 事件流 text-delta / reasoning-delta / tool-call / finish-step）。请求指纹完整复刻官方 `cmd` CLI（v1.31.0 实测还原）：`User-Agent: commandcode/<version>` + `x-command-code-version` / `x-cli-environment: production` / `x-taste-learning` / `x-session-id` / `x-project-slug`，反代流量与 CLI 本体在网关上不可区分，参考了 [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)、[synthetic-coworkers/cmdcode2api](https://github.com/synthetic-coworkers/cmdcode2api) 与 [jiesou/dsh-commandcode-go-provider](https://github.com/jiesou/dsh-commandcode-go-provider)。

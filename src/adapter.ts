@@ -33,6 +33,8 @@ import type {
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import { buildRequest, CC_VERSION, DEFAULT_MAX_TOKENS, eventToChunks, gatewayErrorMessage, parseEventStream } from './protocol.js'
+import type { ImageResolver } from './protocol.js'
+import type { ModelInputModality } from './models.js'
 
 /** One catalog model advertised by the adapter. */
 export interface CommandCodeGoModel {
@@ -46,6 +48,8 @@ export interface CommandCodeGoModel {
   maxTokens?: number
   /** Reasoning-effort ids the gateway accepts for this model, in display order. */
   efforts?: string[]
+  /** Input modalities the model accepts; defaults to text-only. */
+  inputModalities?: readonly ModelInputModality[]
 }
 
 /** Validated connection facts for one operation. */
@@ -76,6 +80,12 @@ export interface CommandCodeGoAdapterOptions {
   onKeySuccess?: (apiKey: string) => void | Promise<void>
   /** A request failed on this key before the first byte — cool the account down. */
   onKeyFailure?: (apiKey: string, message: string) => void | Promise<void>
+  /**
+   * Resolve harness image attachments into gateway data URLs. Absent when the
+   * host has no attachment service: images then degrade to a placeholder
+   * instead of vanishing.
+   */
+  resolveImage?: ImageResolver
 }
 
 /** Hard cap on same-request key failovers, even for very large pools. */
@@ -143,7 +153,9 @@ function modelInfo(provider: string, model: CommandCodeGoModel): LlmModelInfo {
     provider,
     id: model.id,
     name: model.name ?? model.id,
-    inputModalities: ['text'],
+    // 声明该模型真实接受的模态：漏报会让 harness 把图片换成占位文字
+    // （`projectImagesForTextModel`），误报则会让适配器收到它无法发送的图片。
+    inputModalities: [...(model.inputModalities ?? ['text'])],
   }
 }
 
@@ -298,7 +310,7 @@ export class CommandCodeGoAdapter extends LlmAdapter {
     connection: CommandCodeGoConnectionOptions,
     apiKey: string,
   ): AsyncIterable<StreamChunk> {
-    const body = buildRequest(options)
+    const body = await buildRequest(options, this.config.resolveImage)
     const payload = JSON.stringify(body)
     const headers: Record<string, string> = {
       'content-type': 'application/json',

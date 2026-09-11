@@ -11,6 +11,14 @@
  * reference/models.md`), fetched live from jsDelivr so it tracks the `latest`
  * release instead of a checked-in snapshot.
  *
+ * Input modalities are NOT in the listing either, and the catalog's prose
+ * column is not a usable signal (cross-checked: 39 of 70 rows disagree with
+ * the registry — Claude / GPT / Qwen all accept images without ever saying
+ * "vision"). The authoritative source is the CLI's own model registry, whose
+ * `inputModalities` field is what makes the CLI strip images or not. It is
+ * snapshotted into `KNOWN_MODALITIES` below and refreshed live when the
+ * catalog grows an id the snapshot has never seen.
+ *
  * The Go membership rule mirrors the official plans/go page and the opencode
  * commandcode-go plugin:
  * - All open-source models (deepseek, moonshotai, zai-org, MiniMaxAI, xiaomi,
@@ -23,16 +31,125 @@
  * @module commandcode-go/models
  */
 
+/** Input modalities the harness models (`text` is always present). */
+export type ModelInputModality = 'text' | 'image'
+
 export interface GoModel {
   id: string
   name: string
   contextWindow: number
   /** Reasoning-effort ids the gateway accepts for this model, in display order. */
   efforts?: string[]
+  /**
+   * 该模型接受的输入模态。缺省视为纯文本——声明 `image` 会让 harness 把图片
+   * 原样交给适配器，声明缺失/纯文本则会被 harness 换成占位文字（见 usage
+   * 上游 `projectImagesForTextModel`）。
+   */
+  inputModalities?: readonly ModelInputModality[]
 }
 
 /** Context capacity assumed when the listing discloses none. */
 const FALLBACK_CONTEXT_WINDOW = 262_144
+
+/** 官方 CLI 模型注册表快照：模型 id -> 是否接受图像输入。 */
+const KNOWN_MODALITIES: Readonly<Record<string, ModelInputModality>> = {
+
+  "claude-fable-5": "image",
+  "claude-fable-5-1": "image",
+  "claude-haiku-4-5-20251001": "image",
+  "claude-opus-4-7": "image",
+  "claude-opus-4-8": "image",
+  "claude-opus-5": "image",
+  "claude-sonnet-4-6": "image",
+  "claude-sonnet-5": "image",
+  "deepseek/deepseek-v4-flash": "text",
+  "deepseek/deepseek-v4-flash-fast": "text",
+  "deepseek/deepseek-v4-flash-vision-exp": "image",
+  "deepseek/deepseek-v4-pro": "text",
+  "deepseek/deepseek-v4.1-flash": "image",
+  "google/gemini-3.1-flash-lite": "image",
+  "google/gemini-3.5-flash": "image",
+  "google/gemini-3.5-flash-lite": "image",
+  "google/gemini-3.6-flash": "image",
+  "google/gemini-3.7-flash": "image",
+  "google/gemini-3.8-flash": "image",
+  "gpt-5.3-codex": "image",
+  "gpt-5.4": "image",
+  "gpt-5.4-mini": "image",
+  "gpt-5.5": "image",
+  "gpt-5.6-luna": "image",
+  "gpt-5.6-sol": "image",
+  "gpt-5.6-terra": "image",
+  "gpt-6-astra": "image",
+  "inclusionai/ling-3.0-flash-free": "text",
+  "inclusionai/ling-3.0-flash-sante:free": "text",
+  "meituan/LongCat-2.0:free": "text",
+  "meta/muse-spark-1.1": "image",
+  "meta/muse-spark-1.2": "image",
+  "meta/muse-spark-1.2-contributor": "image",
+  "meta/muse-spark-1.3": "image",
+  "meta/muse-spark-1.3-contributor": "image",
+  "minimax/minimax-m2.7-free": "text",
+  "minimax/minimax-m3-free": "image",
+  "MiniMaxAI/MiniMax-M2.5": "text",
+  "MiniMaxAI/MiniMax-M2.7": "text",
+  "MiniMaxAI/MiniMax-M3": "image",
+  "moonshotai/Kimi-K2.5": "image",
+  "moonshotai/Kimi-K2.6": "image",
+  "moonshotai/Kimi-K2.7-Code": "image",
+  "moonshotai/Kimi-K2.7-Code-Highspeed": "image",
+  "moonshotai/Kimi-K3": "image",
+  "nvidia/nemotron-3-ultra-550b-a55b": "text",
+  "poolside/laguna-s-2.1-free": "text",
+  "Qwen/Qwen3.6-Max-Preview": "text",
+  "Qwen/Qwen3.6-Plus": "image",
+  "Qwen/Qwen3.7-Flash": "image",
+  "Qwen/Qwen3.7-Max": "text",
+  "Qwen/Qwen3.7-Plus": "image",
+  "Qwen/Qwen3.8-27B": "image",
+  "Qwen/Qwen3.8-Flash": "image",
+  "Qwen/Qwen3.8-Max": "image",
+  "Qwen/Qwen3.8-Max-0902": "image",
+  "sakana/fugu-ultra": "image",
+  "stepfun/Step-3.5-Flash": "text",
+  "stepfun/Step-3.7-Flash": "image",
+  "tencent/Hy3": "text",
+  "tencent/hy3-paid": "text",
+  "tencent/hy4-preview": "text",
+  "thinkingmachines/inkling": "image",
+  "thinkingmachines/inkling-small": "image",
+  "xai/grok-4.5": "image",
+  "xai/grok-4.6": "image",
+  "xiaomi/mimo-v2.5": "image",
+  "xiaomi/mimo-v2.5-pro": "text",
+  "z-ai/glm-5.3-flash": "image",
+  "zai-org/GLM-5": "text",
+  "zai-org/GLM-5.1": "text",
+  "zai-org/GLM-5.2": "text",
+  "zai-org/GLM-5.2-Fast": "text",
+  "zai-org/GLM-5.3": "text",
+}
+
+/** 该 id 是否出现在离线快照里（用于判断要不要去拉实时注册表）。 */
+export function hasKnownModality(id: string): boolean {
+  return KNOWN_MODALITIES[id] !== undefined
+}
+
+/**
+ * 一个模型最终生效的输入模态。
+ * 优先用实时注册表；它没有该 id 时回退到离线快照；都查不到则按纯文本处理
+ * （保守：宁可让 harness 换成占位文字，也不要静默丢图或误报能力）。
+ */
+export function modalitiesFor(
+  id: string,
+  live?: ReadonlyMap<string, readonly string[]>,
+): ModelInputModality[] {
+  const remote = live?.get(id)
+  if (remote !== undefined) {
+    return remote.includes('image') ? ['text', 'image'] : ['text']
+  }
+  return KNOWN_MODALITIES[id] === 'image' ? ['text', 'image'] : ['text']
+}
 
 /** Premium models included on the Go plan outright (from docs/plans/go). */
 const GO_PREMIUM_EXCEPTIONS: ReadonlySet<string> = new Set([
@@ -120,8 +237,14 @@ export function parseCatalogEfforts(markdown: string): Map<string, string[]> {
 const DEFAULT_MODELS_URL = 'https://api.commandcode.ai/provider/v1/models'
 /** Official CLI catalog served from npm; `@latest` tracks new releases. */
 const CATALOG_URL = 'https://cdn.jsdelivr.net/npm/command-code@latest/dist/bundled/command-code-knowledge/reference/models.md'
+/** Official CLI bundle carrying the model registry (`inputModalities`). */
+const REGISTRY_URL = 'https://cdn.jsdelivr.net/npm/command-code@latest/dist/cli.mjs'
 /** Single-request fetch budget for the catalog (the API listing is separate). */
 const CATALOG_TIMEOUT_MS = 30_000
+/** The registry bundle is ~2.5 MB, so it gets a looser budget. */
+const REGISTRY_TIMEOUT_MS = 60_000
+/** How far back from `inputModalities` to look for the owning registry entry. */
+const REGISTRY_LOOKBEHIND = 600
 
 /** Fetch the official CLI catalog and extract per-model reasoning efforts. */
 export async function fetchCatalogEfforts(
@@ -138,10 +261,75 @@ export async function fetchCatalogEfforts(
   return parseCatalogEfforts(await response.text())
 }
 
-/** Fetch the full catalog and filter to Go-usable models. */
+/**
+ * Parse the CLI's bundled model registry out of `dist/cli.mjs`.
+ *
+ * Each registry entry is an object literal like
+ * `SONNET_5:{id:"claude-sonnet-5",inputModalities:["text","image"],…}`. The
+ * bundle is minified, so instead of assuming a fixed key order we take every
+ * `inputModalities:[…]` occurrence and attribute it to the nearest preceding
+ * `id:"…"` inside a bounded window — which survives reordering that a strict
+ * adjacency regex would miss.
+ *
+ * @param bundle - raw `cli.mjs` source.
+ * @returns model id → declared modalities (entries without `image` are text-only).
+ */
+export function parseCatalogModalities(bundle: string): Map<string, string[]> {
+  const byId = new Map<string, string[]>()
+  const re = /inputModalities:\s*\[([^\]]*)\]/g
+  let match: RegExpExecArray | null
+  while ((match = re.exec(bundle)) !== null) {
+    const window = bundle.slice(Math.max(0, match.index - REGISTRY_LOOKBEHIND), match.index)
+    const ids = [...window.matchAll(/id:"([^"]+)"/g)]
+    const id = ids[ids.length - 1]?.[1]
+    if (id === undefined || byId.has(id)) continue
+    const modalities = (match[1] ?? '')
+      .split(',')
+      .map((part) => part.trim().replace(/^"|"$/g, ''))
+      .filter((part) => part.length > 0)
+    byId.set(id, modalities)
+  }
+  return byId
+}
+
+/**
+ * Fetch the CLI bundle and extract the live modality registry. Expensive
+ * (~2.5 MB), so callers gate it behind the offline snapshot.
+ */
+export async function fetchCatalogModalities(
+  url: string = REGISTRY_URL,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Map<string, string[]>> {
+  const response = await fetchImpl(url, {
+    headers: { accept: 'text/javascript' },
+    signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
+  })
+  if (!response.ok) {
+    throw new Error(`Command Code registry answered HTTP ${response.status}`)
+  }
+  return parseCatalogModalities(await response.text())
+}
+
+/**
+ * 用实时注册表覆盖一批已取到的模型模态。目录只拉一次，实时表只做合并。
+ */
+export function applyModalities(
+  models: readonly GoModel[],
+  live?: ReadonlyMap<string, readonly string[]>,
+): GoModel[] {
+  return models.map(model => ({ ...model, inputModalities: modalitiesFor(model.id, live) }))
+}
+
+/**
+ * Fetch the full catalog and filter to Go-usable models.
+ *
+ * @param liveModalities - optional live registry map merged over the offline
+ * snapshot (see `modalitiesFor`).
+ */
 export async function fetchGoModels(
   url: string = DEFAULT_MODELS_URL,
   fetchImpl: typeof fetch = fetch,
+  liveModalities?: ReadonlyMap<string, readonly string[]>,
 ): Promise<GoModel[]> {
   const response = await fetchImpl(url, {
     headers: { accept: 'application/json' },
@@ -162,7 +350,7 @@ export async function fetchGoModels(
     const contextWindow = positiveNumber(raw.context_length)
       ?? positiveNumber(raw.context_window)
       ?? FALLBACK_CONTEXT_WINDOW
-    models.push({ id, name, contextWindow })
+    models.push({ id, name, contextWindow, inputModalities: modalitiesFor(id, liveModalities) })
   }
   // Stable order keeps the diff against a persisted catalog deterministic.
   models.sort((a, b) => a.id.localeCompare(b.id))

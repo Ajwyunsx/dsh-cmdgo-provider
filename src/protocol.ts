@@ -82,10 +82,34 @@ interface CcToolResultContent {
   output: { type: 'text' | 'error-text'; value: string }
 }
 
+/**
+ * Image part as the gateway wants it. The CLI's Anthropic-shaped internal
+ * blocks are converted to exactly this before dispatch (`convertUserMessage`):
+ * a bare `image` data URL, with no `source` wrapper. The gateway normalizes it
+ * into a `{type:'file', mediaType, data}` prompt part.
+ */
+interface CcImageContent {
+  type: 'image'
+  image: string
+}
+
+type CcUserPart = { type: 'text'; text: string } | CcImageContent
+
 type CcMessage =
-  | { role: 'user'; content: string | unknown[] }
+  | { role: 'user'; content: string | CcUserPart[] }
   | { role: 'assistant'; content: Array<{ type: 'text'; text: string } | { type: 'reasoning'; text: string } | CcToolCallContent> }
   | { role: 'tool'; content: CcToolResultContent[] }
+
+/** Harness image block, derived so no attachment type needs to be imported. */
+type ImageBlock = Extract<ContentBlock, { type: 'image' }>
+
+/**
+ * Resolve one harness image attachment into the gateway's data URL
+ * (`data:<mediaType>;base64,<bytes>`). Returns undefined when the attachment
+ * cannot be read; the serializer then substitutes an explicit placeholder
+ * rather than dropping the image silently.
+ */
+export type ImageResolver = (block: ImageBlock) => Promise<string | undefined>
 
 interface CcTool {
   type: 'function'
@@ -171,27 +195,99 @@ function safeParseJson(raw: string): unknown {
   }
 }
 
-function serializeUser(message: Message): CcMessage {
+/**
+ * Collect every image block in a message, descending into tool-result content
+ * exactly like the harness's own `contentHasImage` does.
+ */
+function collectImages(blocks: ContentBlock[]): ImageBlock[] {
+  const found: ImageBlock[] = []
+  for (const block of blocks) {
+    if (block.type === 'image') found.push(block)
+    else if (block.type === 'tool-result') found.push(...collectImages(block.content))
+  }
+  return found
+}
+
+/** Placeholder used when an image is present but cannot be read. */
+function omittedImageText(block: ImageBlock): string {
+  return `[image omitted: attachment ${String(block.attachment.attachmentId).slice(0, 23)} could not be read]`
+}
+
+/** Turn harness image blocks into gateway parts (or explicit placeholders). */
+async function imageParts(blocks: ImageBlock[], resolveImage?: ImageResolver): Promise<CcUserPart[]> {
+  const parts: CcUserPart[] = []
+  for (const block of blocks) {
+    let dataUrl: string | undefined
+    if (resolveImage !== undefined) {
+      try {
+        dataUrl = await resolveImage(block)
+      } catch (_imageResolutionFailure) {
+        dataUrl = undefined
+      }
+    }
+    parts.push(dataUrl === undefined
+      ? { type: 'text', text: omittedImageText(block) }
+      : { type: 'image', image: dataUrl })
+  }
+  return parts
+}
+
+/**
+ * Serialize one harness message into the gateway's message list.
+ *
+ * Mirrors the CLI's `convertUserMessage`: tool results become their own
+ * `tool` message and text/images become a following `user` message, so a turn
+ * carrying both keeps both. A lone text part stays a plain string, which is
+ * what the gateway expects for ordinary chat turns. Images nested in
+ * tool-result content ride in that follow-up user message — the tool message
+ * itself is text-only.
+ */
+async function serializeUser(message: Message, resolveImage?: ImageResolver): Promise<CcMessage[]> {
+  const out: CcMessage[] = []
   const toolResults = message.content.filter(
     (block): block is Extract<ContentBlock, { type: 'tool-result' }> => block.type === 'tool-result',
   )
+  if (toolResults.length > 0) {
+    out.push({
+      role: 'tool',
+      content: toolResults.map(result => ({
+        type: 'tool-result' as const,
+        toolCallId: result.toolCallId,
+        toolName: 'unknown',
+        output: toolResultOutput(result),
+      })),
+    })
+  }
   const text = flattenText(message.content)
-  if (text.length > 0 || toolResults.length === 0) {
-    return { role: 'user', content: text }
+  const images = await imageParts(collectImages(message.content), resolveImage)
+  if (text.length > 0 || images.length > 0) {
+    const parts: CcUserPart[] = [
+      ...(text.length > 0 ? [{ type: 'text' as const, text }] : []),
+      ...images,
+    ]
+    const single = parts.length === 1 ? parts[0] : undefined
+    out.push({
+      role: 'user',
+      content: single !== undefined && single.type === 'text' ? single.text : parts,
+    })
   }
-  return {
-    role: 'tool',
-    content: toolResults.map(result => ({
-      type: 'tool-result' as const,
-      toolCallId: result.toolCallId,
-      toolName: 'unknown',
-      output: toolResultOutput(result),
-    })),
-  }
+  // 空消息也要占位，否则整轮会塌陷。
+  if (out.length === 0) out.push({ role: 'user', content: '' })
+  return out
 }
 
-/** Build the gateway request envelope for one harness call. */
-export function buildRequest(options: GenerateOptions): CcRequestEnvelope {
+/**
+ * Build the gateway request envelope for one harness call.
+ *
+ * @param options - harness call options.
+ * @param resolveImage - optional resolver turning harness image attachments
+ * into gateway data URLs. Without it images degrade to an explicit placeholder
+ * instead of being dropped.
+ */
+export async function buildRequest(
+  options: GenerateOptions,
+  resolveImage?: ImageResolver,
+): Promise<CcRequestEnvelope> {
   let system = options.system ?? ''
   const messages: CcMessage[] = []
   for (const message of options.messages) {
@@ -199,7 +295,11 @@ export function buildRequest(options: GenerateOptions): CcRequestEnvelope {
       system += (system ? '\n\n' : '') + flattenText(message.content)
       continue
     }
-    messages.push(message.role === 'assistant' ? serializeAssistant(message) : serializeUser(message))
+    if (message.role === 'assistant') {
+      messages.push(serializeAssistant(message))
+      continue
+    }
+    messages.push(...await serializeUser(message, resolveImage))
   }
 
   const tools: CcTool[] = (options.tools ?? [])
