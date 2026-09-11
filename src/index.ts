@@ -25,7 +25,8 @@ import type { RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
-import { deepEqualJson, installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
+import type {} from '@deepseek-ai/dsh-settings'
 import { CommandCodeGoAdapter, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from './adapter.js'
 import type { CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js'
 import { fetchCatalogEfforts, fetchGoModels } from './models.js'
@@ -48,7 +49,7 @@ export const name = 'dsh-cmdgo-provider'
 /** llm 是硬依赖（供应商路由）；webServer / credentials 可选，按需 ctx.get。 */
 export const inject = ['llm']
 
-const NS = settingsNamespace('cmdgo')
+const NS = 'cmdgo'
 const PROVIDER = 'commandcode'
 const DEFAULT_API_KEY_ENV = 'COMMANDCODE_API_KEY'
 
@@ -416,11 +417,15 @@ export function apply(ctx: Context, config: Config): void {
     registeredPolicy = policy
   }
 
-  installSettingsSection(ctx, NS, Config, config, {
-    setSource: (source) => {
-      current = source
-    },
-    onChange: ensureRegistrationFacts,
+  // dsh 0.1.5 起 settings 区块改为服务方法 `ctx.settings.installSection`，
+  // 必须在注入 settings 服务的回调里注册（旧版是顶层函数 installSettingsSection）。
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.settings.installSection(ctx, NS, Config, config, {
+      setSource: (source) => {
+        current = source
+      },
+      onChange: ensureRegistrationFacts,
+    })
   })
 
   // --- 模型目录实时同步 ---

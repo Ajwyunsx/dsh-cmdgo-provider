@@ -18,7 +18,7 @@ PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # 编译期类型解析：peer 包 junction 进包内 node_modules（运行时由 loader 内部解析，不影响）
 mkdir -p "$PKG_DIR/node_modules/@deepseek-ai"
-for pkg in cordis dsh-llm dsh-credentials dsh-launch-environment dsh-settings dsh-timeout schemastery; do
+for pkg in cordis dsh-llm dsh-credentials dsh-launch-environment dsh-settings dsh-util-values dsh-timeout schemastery; do
   src="$DSH_CHECKOUT/node_modules/@deepseek-ai/$pkg"
   dst="$PKG_DIR/node_modules/@deepseek-ai/$pkg"
   if [ -d "$src" ] && [ ! -e "$dst" ]; then ln -s "$src" "$dst" 2>/dev/null || true; fi
