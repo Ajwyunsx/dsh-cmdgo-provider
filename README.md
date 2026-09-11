@@ -92,6 +92,32 @@ harness 的图像块是附件引用，因此经 `attachments.readImageRequest(re
 > 注意：`deepseek/deepseek-v4.1-flash` 在注册表里标记为支持图像，但实测对纯色图识别错误
 > （5/5 失败），疑似网关侧路由到了纯文本部署。插件按注册表声明能力，不单独改写。
 
+## 接口访问控制（0.6.2+）
+
+`/api/cmdgo/*` 此前**既无鉴权、也不校验 Origin/Content-Type**，而 harness 自身的
+`/api/*` 两者都有（无凭据 401、跨站 403）。差集就是一个可利用的 CSRF 面。
+
+**攻击路径**：`text/plain` 属 CORS 安全列表类型，跨站 POST **不触发预检**，所以你在
+DSH 运行期间打开一个恶意页面，它就能静默调用：
+
+- `POST /api/cmdgo/usage/refresh` —— 消耗你的额度与 API key
+- `POST /api/cmdgo/account/remove` —— 删掉账号池里的账号及其密钥
+
+**修复**：路由入口先过闸门，再谈业务。
+
+1. **复用 harness 自己的判据**：`ctx.get('connection')?.requestRejection(req)`。
+   这正是 harness 保护 `/api/*` 的那套（Host/Origin 围墙 + 浏览器会话鉴权），
+   因此 `0.0.0.0` 部署与 LAN 访问（`trustedHosts`）下的行为与原生 API 完全一致，
+   也不会随 harness 升级而漂移。
+2. **`connection` 缺席时**（无浏览器的 composition）退化为本机最小围墙：Host 必须是
+   回环地址、`sec-fetch-site: cross-site` 一律拒绝、带 Origin 时必须与 Host 同源。
+3. **`Content-Type` 兜底**：POST 只接受 `application/json`，把"简单请求"这条绕过
+   预检的路径也堵上。
+4. 被拒的请求会记一条 `[cmdgo] 已拒绝 …` 日志，便于排查。
+
+对正常使用无影响：设置页由 `dsh web` 打开的页面发出，携带会话 cookie 且为同源
+`application/json`，因此照常通过。
+
 ## 协议实现
 
 请求信封与流式解析对齐官方 CLI（`x-command-code-version`、NDJSON 事件流 text-delta / reasoning-delta / tool-call / finish-step）。请求指纹完整复刻官方 `cmd` CLI（v1.31.0 实测还原）：`User-Agent: commandcode/<version>` + `x-command-code-version` / `x-cli-environment: production` / `x-taste-learning` / `x-session-id` / `x-project-slug`，反代流量与 CLI 本体在网关上不可区分，参考了 [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)、[synthetic-coworkers/cmdcode2api](https://github.com/synthetic-coworkers/cmdcode2api) 与 [jiesou/dsh-commandcode-go-provider](https://github.com/jiesou/dsh-commandcode-go-provider)。

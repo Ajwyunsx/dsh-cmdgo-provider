@@ -103,6 +103,57 @@ interface ImageAttachmentService {
 }
 
 /**
+ * dsh-client-connection 提供的 Host 连接服务。只用它自带的
+ * `requestRejection`：那是 harness 保护自身 `/api/*` 的同一套闸门
+ * （Host/Origin 围墙 + 浏览器会话鉴权），返回 403 / 401 / undefined。
+ */
+interface ConnectionGate {
+  requestRejection(request: { headers: Record<string, string | string[] | undefined> }): number | undefined
+}
+
+/** 本机回环主机名（含 IPv6 的带括号写法）。 */
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === 'localhost'
+    || hostname === '::1'
+    || hostname === '[::1]'
+    || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)
+}
+
+/**
+ * `connection` 服务缺席时的最小信任围墙（无浏览器的 composition）。
+ *
+ * 与 harness 自带闸门同一判据：Host 必须是本机回环，跨站标记一律拒绝，
+ * 带 Origin 时 Origin 必须与 Host 同源。网络可达性与鉴权不在本函数范围——
+ * 有 connection 服务时一律走它，那里才有真正的会话鉴权。
+ *
+ * @param headers - Node 请求头（小写键）。
+ * @returns 拒绝时的 HTTP 状态码；放行时 undefined。
+ */
+export function browserTrustRejection(
+  headers: Record<string, string | string[] | undefined>,
+): number | undefined {
+  const host = headers.host
+  if (typeof host !== 'string' || host.length === 0) return 403
+  let hostUrl: URL
+  try {
+    hostUrl = new URL(`http://${host}`)
+  } catch {
+    return 403
+  }
+  if (!isLoopbackHostname(hostUrl.hostname)) return 403
+  if (headers['sec-fetch-site'] === 'cross-site') return 403
+  const origin = headers.origin
+  if (typeof origin === 'string' && origin.length > 0) {
+    try {
+      if (new URL(origin).host !== hostUrl.host) return 403
+    } catch {
+      return 403
+    }
+  }
+  return undefined
+}
+
+/**
  * 插件配置：同时作为 Models 页里该供应商的设置区块形状。
  */
 export interface Config {
@@ -418,9 +469,41 @@ export function apply(ctx: Context, config: Config): void {
       kind: 'prefix',
       path: '/api/cmdgo',
       handler: async (rawReq: unknown, rawRes: unknown): Promise<void> => {
-        const req = rawReq as { method?: string; url?: string; on: (event: string, cb: (chunk?: Buffer) => void) => void }
+        const req = rawReq as {
+          method?: string
+          url?: string
+          headers?: Record<string, string | string[] | undefined>
+          on: (event: string, cb: (chunk?: Buffer) => void) => void
+        }
         const pathname = (req.url ?? '/').split('?')[0].replace(/\/+$/, '')
         const action = pathname.slice('/api/cmdgo'.length) || '/'
+        // --- 浏览器信任 / 鉴权闸门 ---
+        // 这些路由此前既无鉴权也不校验 Origin/Content-Type：恶意页面能用
+        // CORS 安全列表类型（text/plain，不触发预检）跨站 POST，静默触发
+        // /usage/refresh（消耗额度）或 /account/remove（删除账号）。
+        // 优先复用 connection 服务自带的闸门（与 harness 保护 /api/* 同一套），
+        // 它在 0.0.0.0 部署与 LAN 访问下也正确；缺席时退化为本机最小围墙。
+        const headers = req.headers ?? {}
+        const connection = ctx.get('connection') as ConnectionGate | undefined
+        const rejection = connection !== undefined
+          ? connection.requestRejection({ headers })
+          : browserTrustRejection(headers)
+        if (rejection !== undefined) {
+          ctx.logger.warn('[cmdgo] 已拒绝 %s %s（HTTP %d）', req.method ?? 'GET', pathname, rejection)
+          sendJson(rawRes, rejection, {
+            ok: false,
+            error: rejection === 401
+              ? '需要浏览器会话凭据：请从 dsh web 打印的地址打开页面'
+              : '已拒绝跨站或非本机请求',
+          })
+          return
+        }
+        // 跨站「简单请求」兜底：只接受 JSON 正文（其它类型会被浏览器
+        // 当安全列表请求直接发出，从而绕过预检）。
+        if (req.method === 'POST' && !/application\/json/i.test(String(headers['content-type'] ?? ''))) {
+          sendJson(rawRes, 415, { ok: false, error: 'Content-Type 必须是 application/json' })
+          return
+        }
         try {
           if (req.method === 'GET' && (action === '/status' || action === '/')) {
             sendJson(rawRes, 200, { ok: true, ...(await statusSnapshot()) })
