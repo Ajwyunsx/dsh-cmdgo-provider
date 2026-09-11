@@ -108,7 +108,12 @@ harness 的图像块是附件引用，因此经 `attachments.readImageRequest(re
 ## 排错
 
 - **装完不显示**：`dsh plugin add` 只写 profile 清单，运行中的 loader 需要重启（或热装配工具）才会加载；另外检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否残留同 id 的 `disabled: true` 条目——卸载器会写它阻断自装配，重装前应删除。
-- **模型列表为空**：目录来自 `https://api.commandcode.ai/provider/v1/models`（免鉴权），检查宿主网络；首次扫描失败会在日志告警并每 15 分钟重试。
+- **模型列表为空（显示 0）**：目录来自 `https://api.commandcode.ai/provider/v1/models`（免鉴权）。
+  冷启动时网络可能尚未就绪，因此首扫失败会按 **3s → 10s → 30s → 60s** 快速退避重试，
+  不再干等 15 分钟；设置页会同时给出失败原因。注意 dsh 会**过滤掉 0 个模型的供应商分组**，
+  所以目录为空时 Command Code Go 会整个从 Models 页消失。
+  另外模型列表**不再等** effort 元数据（jsDelivr）或实时模态注册表——上游一慢就更容易看到空列表。
+  若长期为 0，点「Models」页刷新，并检查宿主能否访问上述域名。
 - **对话报 MISSING_CREDENTIAL**：先到「设置 → CommandCode Go」完成登录，或手动向 `~/.dsh/.credentials.yaml` 写入 `COMMANDCODE_API_KEY: user_xxxx`。
 - **回调收不到**：回调服务器绑定在宿主 `127.0.0.1:5959..5968`；若浏览器与宿主不同机，需保证 `localhost:<port>` 能回到宿主（端口转发/SSH 隧道）。
 

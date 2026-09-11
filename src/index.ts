@@ -39,6 +39,7 @@ import type { PoolAccount } from './pool.js'
 import { UsageReader } from './usage.js'
 import type { UsageStatus } from './usage.js'
 import { applyModalities, fetchCatalogModalities, hasKnownModality } from './models.js'
+import type { GoModel } from './models.js'
 import type { ImageResolver } from './protocol.js'
 
 export {
@@ -321,6 +322,8 @@ export function apply(ctx: Context, config: Config): void {
       /** 该账号的额度快照；首次轮询时可能尚未就绪。 */
       usage?: UsageStatus
     }>
+    /** 最近一次目录同步的错误；为空表示目录已就绪。 */
+    catalogError?: string
   }> {
     const ref = currentRef()
     const credentials = ctx.get('credentials')
@@ -366,6 +369,7 @@ export function apply(ctx: Context, config: Config): void {
       credentialConfigured: configured,
       ...(source === undefined ? {} : { credentialSource: source }),
       modelCount: scanned.length,
+      ...(catalogError === undefined ? {} : { catalogError }),
       login: login.status,
       activeAccounts: pool.activeCount(now),
       accounts: rows,
@@ -551,10 +555,11 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   // --- 模型目录实时同步 ---
-  let refreshTimer: ReturnType<typeof setInterval> | undefined
+  // 用 setTimeout 链而不是 setInterval：首扫失败必须立刻重试，不能干等 15 分钟。
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined
 
   ctx.effect(() => () => {
-    if (refreshTimer !== undefined) clearInterval(refreshTimer)
+    if (refreshTimer !== undefined) clearTimeout(refreshTimer)
     refreshTimer = undefined
   })
 
@@ -580,41 +585,84 @@ export function apply(ctx: Context, config: Config): void {
     return liveModalities
   }
 
-  /** 扫描 Go 目录并换入 adapter 视图。 */
-  async function sync(): Promise<void> {
-    const entries = await fetchGoModels()
-    if (entries.length === 0) {
-      throw new Error('no Go models found; keeping the previous catalog')
-    }
-    const live = await ensureModalities(entries.map(entry => entry.id))
-    const withModalities = live === undefined ? entries : applyModalities(entries, live)
-    // effort 元数据尽力而为：目录抖动不能拖垮模型列表。
-    let efforts = new Map<string, string[]>()
-    try {
-      efforts = await fetchCatalogEfforts()
-    } catch (error) {
-      ctx.logger.warn('[cmdgo] effort catalog scan failed: %s', error instanceof Error ? error.message : String(error))
-    }
-    const next = withModalities.map(entry => ({
-      id: entry.id,
-      name: entry.name,
-      contextWindow: entry.contextWindow,
-      inputModalities: entry.inputModalities,
-      ...(efforts.get(entry.id) === undefined ? {} : { efforts: efforts.get(entry.id)! }),
-    }))
+  /** 把目录条目转成 adapter 视图；effort 可用时一并带上。 */
+  const toScanned = (entries: readonly GoModel[], efforts?: ReadonlyMap<string, string[]>): CommandCodeGoModel[] =>
+    entries.map((entry) => {
+      const effort = efforts?.get(entry.id)
+      return {
+        id: entry.id,
+        name: entry.name,
+        contextWindow: entry.contextWindow,
+        inputModalities: entry.inputModalities,
+        ...(effort === undefined ? {} : { efforts: effort }),
+      }
+    })
+
+  /** 换入新目录视图；无变化时不写、不刷屏。 */
+  const publish = (next: CommandCodeGoModel[]): void => {
     if (deepEqualJson(next, scanned)) return
     scanned = next
     const visionCount = next.filter(m => m.inputModalities?.includes('image')).length
     ctx.logger.info('[cmdgo] synced %d Go model(s)（%d 个支持图像）: %s', next.length, visionCount, next.map(m => m.id).join(', '))
   }
 
-  void sync().catch((error: unknown) => {
-    ctx.logger.warn('[cmdgo] 初始模型目录扫描失败: %s', error instanceof Error ? error.message : String(error))
-  })
-  refreshTimer = setInterval(() => {
-    void sync().catch((error: unknown) => {
-      ctx.logger.warn('[cmdgo] 模型目录刷新失败: %s', error instanceof Error ? error.message : String(error))
-    })
-  }, REFRESH_MS)
-  refreshTimer.unref?.()
+  /**
+   * 扫描 Go 目录并换入 adapter 视图。
+   *
+   * 顺序很关键：**先发布模型列表，再补可选元数据**。模型模态来自离线快照
+   * （同步且完整），因此列表本身不必等 jsDelivr 的 effort 元数据，更不必等
+   * 那 2.5 MB 的实时注册表——否则上游一慢，用户在整个等待期看到的就是
+   * 「0 个模型」，而 dsh 会把 0 模型的供应商分组整个过滤掉。
+   */
+  async function sync(): Promise<void> {
+    const entries = await fetchGoModels()
+    if (entries.length === 0) {
+      throw new Error('no Go models found; keeping the previous catalog')
+    }
+    publish(toScanned(entries))
+    // effort 元数据尽力而为：慢或被墙都不影响已经可用的模型列表。
+    let efforts: Map<string, string[]> | undefined
+    try {
+      efforts = await fetchCatalogEfforts()
+    } catch (error) {
+      ctx.logger.warn('[cmdgo] effort catalog scan failed: %s', error instanceof Error ? error.message : String(error))
+    }
+    if (efforts !== undefined) publish(toScanned(entries, efforts))
+    // 目录出现快照未知的模型时，才补拉实时模态注册表。
+    const live = await ensureModalities(entries.map(entry => entry.id))
+    if (live !== undefined) publish(toScanned(applyModalities(entries, live), efforts))
+  }
+
+  // 首扫失败必须快速重试：设备刚启动时网络往往还没就绪，若沿用 15 分钟周期，
+  // 模型列表会整整空 15 分钟（UI 表现为「同步模型 0」）。
+  const RETRY_BACKOFF_MS = [3_000, 10_000, 30_000, 60_000]
+  let retryIndex = 0
+  let catalogError: string | undefined
+
+  const schedule = (delayMs: number): void => {
+    if (refreshTimer !== undefined) clearTimeout(refreshTimer)
+    refreshTimer = setTimeout(() => { void runSync() }, delayMs)
+    refreshTimer.unref?.()
+  }
+
+  async function runSync(): Promise<void> {
+    try {
+      await sync()
+      retryIndex = 0
+      catalogError = undefined
+      schedule(REFRESH_MS)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      catalogError = message
+      // 已有目录时按常规周期重试；一次都还没成功则快速退避重试。
+      const delay = scanned.length > 0
+        ? REFRESH_MS
+        : RETRY_BACKOFF_MS[Math.min(retryIndex, RETRY_BACKOFF_MS.length - 1)]!
+      retryIndex += 1
+      ctx.logger.warn('[cmdgo] 模型目录同步失败（%ds 后重试）: %s', Math.round(delay / 1000), message)
+      schedule(delay)
+    }
+  }
+
+  void runSync()
 }
