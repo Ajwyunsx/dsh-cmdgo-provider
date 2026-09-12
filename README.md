@@ -33,6 +33,7 @@ dsh plugin add github:Ajwyunsx/dsh-cmdgo-provider
   1. 第一个选项是**登录地址**——点击「生成登录地址」，host 在 `127.0.0.1:5959..5968` 起本机回调服务器，拼出 `https://commandcode.ai/studio/auth/cli?callback=…&state=…`；
   2. 「打开登录页」→ 浏览器完成授权；
   3. Studio 页面 POST `{apiKey, state, userId, userName, keyName}` 回本机 `/callback`，state 校验通过后 API Key 自动写入凭据存储（默认 `COMMANDCODE_API_KEY`），面板显示等待回调 → 已登录。
+- **右上角额度 HUD**：会话头部右侧的紧凑胶囊显示「最紧的那条额度」+ 账号数，点开是全部账号的额度浮层，并可直接「＋ 添加账号」——见 [右上角额度 HUD](#右上角额度-hud070)。
 - **HTTP API**：`GET /api/cmdgo/status`、`POST /api/cmdgo/login|cancel|logout`、`POST /api/cmdgo/account/toggle|remove`、`POST /api/cmdgo/usage/refresh`。
 
 ## 多账号池（0.2.0+）
@@ -62,6 +63,25 @@ dsh plugin add github:Ajwyunsx/dsh-cmdgo-provider
 - **缓存**：按账号缓存 60s，`/status` 只读缓存并在后台补刷新，2.5s 的前端轮询不会打到网关；
   「刷新额度」/「刷新全部额度」按钮走 `POST /api/cmdgo/usage/refresh` 立即拉取。
 - 池为空但主 ref 有 key 时，也展示一行只读的额度（无启停/移除按钮）。
+
+## 右上角额度 HUD（0.7.0+）
+
+不用进设置页也能盯着额度：会话头部右侧（内置工具按钮的右边）多一个紧凑胶囊，
+点开就是全部账号的额度面板。
+
+- **胶囊**（槽 `conversation.session.header.utilities`，`order` 最大 → 最靠右）：
+  显示健康点 + `CC` + 「最紧的那条额度」+ 账号数（`×n`）。「最紧」= 跨所有账号、
+  跨 `5H` / `周` / `月` 取已用占比最高的那条——也就是最先卡住你的那条；
+  占用 ≥70% 转黄、≥90% 转红。账号池为空时整个胶囊不渲染，不留空位。
+- **面板**（槽 `shell.overlay`）：逐账号列出名字、状态（`冷却中` / `已停用` / `缺凭据` /
+  `fail×n`）与 5H / 周 / 月三条额度（复用设置页的额度组件）。面板是帧级浮层，
+  不受会话头部溢出与层叠上下文影响；`Esc` 或点击面板外关闭。
+- **添加账号**：面板内「＋ 添加账号」直接发起 OAuth——生成登录地址 → 打开登录页 →
+  回调自动入池，新账号的额度随下一轮轮询出现，不用来回切设置页。
+  「刷新全部」走 `POST /api/cmdgo/usage/refresh`。
+- **数据面不变**：复用 `GET /api/cmdgo/status`，15s 轮询；宿主按账号缓存 60s，
+  因此轮询不会打到网关。胶囊只读共享快照，不额外发请求。
+- 深浅色主题都跟随 `--dsw-alias-*` 变量（带上浅色兜底），不写死颜色。
 
 ## 多模态 / 图像输入（0.6.0+）
 
