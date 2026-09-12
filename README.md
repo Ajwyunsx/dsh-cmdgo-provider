@@ -133,6 +133,21 @@ DSH 运行期间打开一个恶意页面，它就能静默调用：
 
 ## 排错
 
+- **重启后模型选择器里没有 Command Code Go，刷新页面就恢复**（#4）：注册竞态。
+  `apply()` 注册 adapter 时目录还是空的（首扫是异步的），而客户端的
+  `ModelCatalogDirectory` 只在 `llm/adapters-updated` / `settings/document-updated` /
+  `credentials/reference-updated` 上失效重载。若页面在首扫完成前加载，它会缓存
+  「commandcode 有 0 个模型」的快照，而 host 侧 `buildModelCatalog` 又会把 0 模型的
+  供应商分组整个过滤掉——于是该供应商一直不可见，直到手动刷新。
+
+  0.6.4 起 `publish()` 在**客户端可见投影**（id / name / efforts）变化时调用
+  `registration.replace([PROVIDER])` 宣告一次（它会发出 `llm/adapters-updated`）。
+  目录到货、effort 元数据到货、后续新增模型都会宣告；纯 `inputModalities` 变化
+  不在客户端投影里，因此不会造成无谓重载。
+
+  登录后之所以正常，是因为写凭据会触发 `credentials/reference-updated`，把这个
+  竞态掩盖掉了。
+
 - **报 `Command Code stream ended without finish-step`**：0.6.3 前这个报错几乎总是
   **掩盖了真正的原因**。网关的终止事件不止 `finish-step`：
 
