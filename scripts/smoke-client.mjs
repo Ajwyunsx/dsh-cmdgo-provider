@@ -173,6 +173,51 @@ check('面板含 5H / 周 / 月 三行额度', openText.includes('5H') && openTe
 check('面板含「添加账号」入口', openText.includes('添加账号'))
 check('面板含刷新全部', openText.includes('刷新全部'))
 
+/* 合计与理论调用次数：宿主 meter 的三种状态都要如实渲染。 */
+const settle = async () => { for (let i = 0; i < 12; i += 1) await Promise.resolve() }
+const renderPanel = () => bySlot['shell.overlay'].component({})
+
+console.log('[4b] 合计剩余（全部账号额度相加）')
+// 注意：open 是「打开前」那一帧（此时面板返回 null），要用打开后的 panelOpen。
+const sumText = openText
+check('面板含「合计剩余」', sumText.includes('合计剩余'))
+// alice 月剩 4 + bob 月剩 9 = 13；5H 0.6+2.7=3.3；周 3+未上报=3
+check('月合计 $13.00（4+9）', sumText.includes('$13.00（月）'), sumText.slice(sumText.indexOf('合计剩余'), sumText.indexOf('合计剩余') + 120))
+check('5H 合计 $3.30', sumText.includes('5H $3.30'))
+check('周合计 $3.00', sumText.includes('周 $3.00'))
+check('标出有数据的账号数 2/2', sumText.includes('2/2 个账号有数据'))
+
+console.log('[4c] 理论调用次数：无 meter（旧宿主）不编数字')
+check('面板含「理论次数」', sumText.includes('理论次数'))
+check('旧宿主提示需要 0.8.0', sumText.includes('需要宿主 0.8.0'))
+check('旧宿主不显示次数', !sumText.includes('≈ '))
+
+console.log('[4d] 理论调用次数：样本不足')
+status.meter = { totalCalls: 2, attributedCalls: 0, consumed: 0, samples: 0, ready: false, updatedAt: 0 }
+renderPanel()
+await settle()
+let t4d = JSON.stringify(renderPanel())
+check('样本不足时如实说明', t4d.includes('样本不足'), 'no 样本不足')
+check('样本不足时给出已计数', t4d.includes('已计 2 次调用'))
+check('样本不足时不给次数', !t4d.includes('≈ '))
+
+console.log('[4e] 理论调用次数：样本足够（实测 $0.05/次）')
+status.meter = { totalCalls: 41, attributedCalls: 39, consumed: 1.95, perCall: 0.05, samples: 5, ready: true, updatedAt: Date.now() }
+renderPanel()
+await settle()
+const panelReady = renderPanel()
+const t4e = JSON.stringify(panelReady)
+check('给出月合计理论次数 13/0.05 = 260', t4e.includes('≈ 260 次'), t4e.slice(t4e.indexOf('理论次数'), t4e.indexOf('理论次数') + 220))
+check('给出 5H 窗口内次数 3.3/0.05 = 66', t4e.includes('5H 窗口内 ≈ 66 次'))
+check('标注实测单价与样本数', t4e.includes('$0.05/次') && t4e.includes('样本 39 次调用'))
+
+console.log('[4f] 胶囊同步显示合计与次数')
+const pillReady = bySlot['conversation.session.header.utilities'].component({})
+const t4f = JSON.stringify(pillReady)
+check('胶囊含合计 Σ$13.0', t4f.includes('Σ$13.0'), t4f)
+check('胶囊含 ≈260次', t4f.includes('≈260次'))
+check('胶囊保留最紧百分比', t4f.includes('5H 80.0%'))
+
 console.log('[5] 样式注入')
 check('HUD 样式独立注入且含主题变量',
   (styleNodes.get('cmdgo-hud-style') || {}).textContent?.includes('--dsw-alias-label-primary') === true,

@@ -38,6 +38,8 @@ import { AccountPool } from './pool.js'
 import type { PoolAccount } from './pool.js'
 import { UsageReader } from './usage.js'
 import type { UsageStatus } from './usage.js'
+import { CallMeter } from './meter.js'
+import type { MeterSnapshot } from './meter.js'
 import { applyModalities, fetchCatalogModalities, hasKnownModality } from './models.js'
 import type { GoModel } from './models.js'
 import type { ImageResolver } from './protocol.js'
@@ -52,6 +54,8 @@ export { fetchCatalogEfforts, fetchGoModels, isGoModel, parseCatalogEfforts } fr
 export { CommandCodeLoginManager, DEFAULT_STUDIO_BASE } from './oauth.js'
 export type { LoginStatus, LoginSuccessInfo } from './oauth.js'
 export { UsageReader, normalizeUsage, resolvePlan } from './usage.js'
+export { CallMeter, MIN_METER_CALLS, MIN_METER_SAMPLES } from './meter.js'
+export type { CallMeterOptions, MeterSnapshot } from './meter.js'
 export type {
   PlanSpec,
   UsageMonthly,
@@ -241,6 +245,11 @@ export function apply(ctx: Context, config: Config): void {
     log: (message) => { ctx.logger.info(message) },
   })
 
+  // --- 调用计量：实测「平均单次消耗」，用于估算理论剩余调用次数 ---
+  // 网关不返回调用次数，只能自己把「请求计数」与「额度差」对齐（见 meter.ts）。
+  const meter = new CallMeter({ log: (message) => { ctx.logger.info(message) } })
+  ctx.effect(() => () => { meter.dispose() })
+
   /** 取账号的 API key；池账号与主 ref 通用（只用 account.ref）。 */
   const accountKey = async (account: { ref: CredentialRef }): Promise<string | undefined> => {
     const credentials = ctx.get('credentials')
@@ -256,7 +265,10 @@ export function apply(ctx: Context, config: Config): void {
         usageReader.markMissing(account.ref)
         return undefined
       }
-      return usageReader.refresh(account.ref, key)
+      return usageReader.refresh(account.ref, key).then((snapshot) => {
+        meter.noteUsage(account.ref, snapshot.monthly.remaining)
+        return snapshot
+      })
     }).catch(() => { /* 失败原因已记录在 reader 里，UI 会显示 warning */ })
   }
 
@@ -267,7 +279,9 @@ export function apply(ctx: Context, config: Config): void {
       usageReader.markMissing(account.ref)
       return
     }
-    await usageReader.refresh(account.ref, key, { force: true }).catch(() => {})
+    await usageReader.refresh(account.ref, key, { force: true })
+      .then((snapshot) => { meter.noteUsage(account.ref, snapshot.monthly.remaining) })
+      .catch(() => {})
   }
 
   const resolveApiKey = async (): Promise<string> => {
@@ -373,6 +387,8 @@ export function apply(ctx: Context, config: Config): void {
       /** 该账号的额度快照；首次轮询时可能尚未就绪。 */
       usage?: UsageStatus
     }>
+    /** 实测调用计量：平均单次消耗 → 理论剩余调用次数。 */
+    meter: MeterSnapshot
     /** 最近一次目录同步的错误；为空表示目录已就绪。 */
     catalogError?: string
   }> {
@@ -423,6 +439,7 @@ export function apply(ctx: Context, config: Config): void {
       ...(catalogError === undefined ? {} : { catalogError }),
       login: login.status,
       activeAccounts: pool.activeCount(now),
+      meter: meter.snapshot(),
       accounts: rows,
     }
   }
@@ -607,7 +624,13 @@ export function apply(ctx: Context, config: Config): void {
     poolSize: () => Math.max(1, pool.size),
     onKeySuccess: async (apiKey) => {
       const account = await accountForKey(apiKey)
-      if (account !== undefined) pool.reportSuccess(account)
+      if (account !== undefined) {
+        pool.reportSuccess(account)
+        meter.noteCall(account.ref)
+        return
+      }
+      // 未入池（池为空时的主 ref / env key）：与 /status 的合成行同 ref 记账。
+      meter.noteCall(currentRef())
     },
     onKeyFailure: async (apiKey, message) => {
       const account = await accountForKey(apiKey)
