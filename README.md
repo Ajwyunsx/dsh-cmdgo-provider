@@ -115,6 +115,38 @@ DSH 运行期间打开一个恶意页面，它就能静默调用：
    预检的路径也堵上。
 4. 被拒的请求会记一条 `[cmdgo] 已拒绝 …` 日志，便于排查。
 
+## 思考强度（reasoning effort）是真的吗
+
+**是真的，但强度因模型而异。** 实测结论（0.6.5 复核）：
+
+- **链路完整**：harness 会按本插件声明的档位校验选择（不在列表里直接
+  `UNSUPPORTED_REASONING_EFFORT`）；`buildRequest` 把 `params.reasoning_effort`
+  发出去；**网关会在 `start-step` 的回显里把它原样带回**，并且 reasoning token
+  数确实随档位变化。
+- **但不是每个模型都买账**。同一个 prompt 实测：
+
+  | 模型 | Auto（不传） | low | max |
+  | --- | --- | --- | --- |
+  | `z-ai/glm-5.3-flash` | 121 | **14** | **47** |
+  | `deepseek/deepseek-v4.1-flash` | 47 | 38 | 49 |
+  | `zai-org/GLM-5.3` | 0 | 0 | 0 |
+
+  即：`glm-5.3-flash` 上档位效果显著；`deepseek-v4.1-flash` 几乎无差别；
+  `GLM-5.3` 干脆不产生 reasoning token。**把它当成"调这个模型多想一点"的旋钮是
+  合理的，但别指望所有模型都遵守。**
+
+- **两个曾经的坑（已修）**：
+  - `minimal` 曾被列入兜底梯子，但网关对它返回 **HTTP 400
+    `invalid_reasoning_effort`**——官方 CLI 认可的集合是
+    `low, medium, high, xhigh, max`，不含 `minimal`。现已移除，且只会提供该集合内的值。
+  - `Off` 曾作为档位显示，但它对应"不下发 effort 字段"。网关没有"关闭思考"这个值
+    ——实测不传字段反而比 `max` **更重**（上表 121 vs 47）。现已更名为 **`Auto`**
+    （含义：不指定，由网关/供应商决定），避免谎称能关闭。
+
+  哨兵 id 仍保留为 `off` 以兼容已持久化的选择；官方 CLI 也是同样的处理
+  （`if (!n || "off" === n) return;`）。
+
+
 对正常使用无影响：设置页由 `dsh web` 打开的页面发出，携带会话 cookie 且为同源
 `application/json`，因此照常通过。
 

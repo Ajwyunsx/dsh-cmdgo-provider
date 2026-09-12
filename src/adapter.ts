@@ -130,10 +130,18 @@ export { DEFAULT_MAX_TOKENS }
 const STREAM_IDLE_TIMEOUT_CODE = 'LLM_STREAM_IDLE_TIMEOUT'
 const OFF_REASONING_EFFORT = ReasoningEffortId('off')
 
-/** Effort labels in the gateway's own vocabulary, for selector display. */
+/**
+ * Effort labels in the gateway's own vocabulary, for selector display.
+ *
+ * `off` is NOT a level the gateway accepts — it is the CLI's own sentinel for
+ * "name no effort and let the provider decide" (the bundled CLI does
+ * `if (!n || "off" === n) return;` before building the request). It is labelled
+ * `Auto` rather than `Off` on purpose: omitting the field does not disable
+ * reasoning on this gateway, it selects the provider default, which measured
+ * *heavier* than `max` on one model (121 vs 47 reasoning tokens).
+ */
 const EFFORT_LABELS: Readonly<Record<string, string>> = {
-  off: 'Off',
-  minimal: 'Minimal',
+  off: 'Auto',
   low: 'Low',
   medium: 'Medium',
   high: 'High',
@@ -141,8 +149,19 @@ const EFFORT_LABELS: Readonly<Record<string, string>> = {
   max: 'Max',
 }
 
-/** The full reasoning-effort ladder the gateway accepts, low to high. */
-const FULL_EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+/**
+ * The ladder used when a model's own effort list is unknown.
+ *
+ * Exactly the vocabulary the bundled CLI accepts (`Cw = ["low","medium",
+ * "high","xhigh","max"]`). `minimal` is deliberately absent: it is NOT in that
+ * set, and the gateway answers HTTP 400 `invalid_reasoning_effort` for it
+ * (verified on two models) — offering it would only produce guaranteed
+ * failures.
+ */
+const FULL_EFFORT_LADDER = ['low', 'medium', 'high', 'xhigh', 'max']
+
+/** Values the gateway accepts; anything else is filtered out of the selector. */
+const GATEWAY_EFFORTS: ReadonlySet<string> = new Set(FULL_EFFORT_LADDER)
 
 function effortInfo(effort: string): { id: ReturnType<typeof ReasoningEffortId>, name: string } {
   return { id: ReasoningEffortId(effort), name: EFFORT_LABELS[effort] ?? effort }
@@ -160,20 +179,28 @@ function modelInfo(provider: string, model: CommandCodeGoModel): LlmModelInfo {
 }
 
 /**
- * Build the reasoning-effort selector for one model. Models whose effort
- * support is known expose exactly their supported levels (plus `off`);
- * models without metadata expose the full ladder (`off` plus minimal to
- * max) so every gateway level stays reachable. No default effort is pinned:
- * the gateway decides when a request names none.
+ * Build the reasoning-effort selector for one model.
+ *
+ * Models with a known effort list expose exactly those levels; models whose
+ * catalog entry is `—` expose the gateway's accepted ladder. In both cases
+ * `Auto` is offered first, meaning "send no effort and let the provider
+ * decide" — the same sentinel the bundled CLI uses. No default effort is
+ * pinned, so a request that names none stays exactly that.
+ *
+ * Only values the gateway accepts may appear here: the harness rejects a
+ * selection outside this list with `UNSUPPORTED_REASONING_EFFORT`, and the
+ * gateway answers HTTP 400 for anything outside its own set.
  */
 function reasoningFor(model: CommandCodeGoModel | undefined): LlmModelReasoningInfo {
-  const efforts = model?.efforts
-  const levels = efforts !== undefined && efforts.length > 0
-    ? efforts
+  const declared = model?.efforts
+  // 声明了档位就只给网关接受的子集；声明了却全是非法值时只留 Auto。
+  // 未声明（`—`）时给网关的通用梯子。
+  const levels = declared !== undefined && declared.length > 0
+    ? declared.filter(effort => GATEWAY_EFFORTS.has(effort))
     : FULL_EFFORT_LADDER
   return {
     efforts: [
-      { id: OFF_REASONING_EFFORT, name: EFFORT_LABELS.off },
+      { id: OFF_REASONING_EFFORT, name: EFFORT_LABELS.off! },
       ...levels.map(effortInfo),
     ],
   }
