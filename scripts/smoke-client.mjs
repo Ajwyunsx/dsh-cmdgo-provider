@@ -218,6 +218,24 @@ check('胶囊含合计 Σ$13.0', t4f.includes('Σ$13.0'), t4f)
 check('胶囊含 ≈260次', t4f.includes('≈260次'))
 check('胶囊保留最紧百分比', t4f.includes('5H 80.0%'))
 
+console.log('[4g] 剩余额度（美元）显示在百分比左侧')
+// 文案区分：行内是「剩$0.60」（无空格），tooltip 里是「剩余 $0.60」（有空格）。
+// 用无空格形式命中，才能确保断言的是左侧那一列而不是 title 属性。
+const iRem = t4e.indexOf('剩$0.60')
+const iPct = t4e.indexOf('80.0%')
+check('alice 5H 显示 剩$0.60', iRem >= 0)
+check('剩余额度排在百分比之前（即左侧）', iRem >= 0 && iPct >= 0 && iRem < iPct, 'iRem=' + iRem + ' iPct=' + iPct)
+check('月度行也显示剩余 剩$4.00', t4e.includes('剩$4.00'))
+check('第二个账号的 5H 剩余 剩$2.70', t4e.includes('剩$2.70'))
+check('周行显示剩余 剩$3.00', t4e.includes('剩$3.00'))
+// 真正验证「缺字段就不渲染」：把某窗口的 remaining 抹掉再看。
+const savedWeekly = status.accounts[0].usage.weekly
+status.accounts[0].usage.weekly = { used: 3, cap: 6, percent: 0.5 }
+renderPanel()
+await settle()
+check('remaining 缺失时该列整体不渲染（不出现 剩$—）', !/剩\$—/.test(JSON.stringify(renderPanel())))
+status.accounts[0].usage.weekly = savedWeekly
+
 console.log('[5] 样式注入')
 check('HUD 样式独立注入且含主题变量',
   (styleNodes.get('cmdgo-hud-style') || {}).textContent?.includes('--dsw-alias-label-primary') === true,
