@@ -40,6 +40,8 @@ import { UsageReader } from './usage.js'
 import type { UsageStatus } from './usage.js'
 import { CallMeter } from './meter.js'
 import type { MeterSnapshot } from './meter.js'
+import { RequestStats } from './request-stats.js'
+import type { RequestStatsView } from './request-stats.js'
 import { applyModalities, fetchCatalogModalities, hasKnownModality } from './models.js'
 import type { GoModel } from './models.js'
 import type { ImageResolver } from './protocol.js'
@@ -56,6 +58,14 @@ export type { LoginStatus, LoginSuccessInfo } from './oauth.js'
 export { UsageReader, normalizeUsage, resolvePlan } from './usage.js'
 export { CallMeter, MIN_METER_CALLS, MIN_METER_SAMPLES } from './meter.js'
 export type { CallMeterOptions, MeterSnapshot } from './meter.js'
+export { cacheHitRate, RequestStats, DEFAULT_MAX_SESSION_ROWS } from './request-stats.js'
+export type {
+  RequestStatsCounters,
+  RequestStatsLast,
+  RequestStatsRow,
+  RequestStatsSample,
+  RequestStatsView,
+} from './request-stats.js'
 export type {
   PlanSpec,
   UsageMonthly,
@@ -250,6 +260,10 @@ export function apply(ctx: Context, config: Config): void {
   const meter = new CallMeter({ log: (message) => { ctx.logger.info(message) } })
   ctx.effect(() => () => { meter.dispose() })
 
+  // --- 请求用量台账：缓存读 / 写按会话聚合，供 HUD 验证缓存亲和（issue #6） ---
+  // 纯内存，进程内有效；不落盘、不含凭据。
+  const requestStats = new RequestStats()
+
   /** 取账号的 API key；池账号与主 ref 通用（只用 account.ref）。 */
   const accountKey = async (account: { ref: CredentialRef }): Promise<string | undefined> => {
     const credentials = ctx.get('credentials')
@@ -363,7 +377,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /** 客户端可见的状态快照（绝不携带 API key 明文）。 */
-  async function statusSnapshot(): Promise<{
+  async function statusSnapshot(forSessionId?: string): Promise<{
     provider: string
     credentialRef: string
     credentialConfigured: boolean
@@ -389,6 +403,8 @@ export function apply(ctx: Context, config: Config): void {
     }>
     /** 实测调用计量：平均单次消耗 → 理论剩余调用次数。 */
     meter: MeterSnapshot
+    /** 缓存读 / 写台账（按会话聚合，见 request-stats.ts）。 */
+    cache: RequestStatsView
     /** 最近一次目录同步的错误；为空表示目录已就绪。 */
     catalogError?: string
   }> {
@@ -440,6 +456,7 @@ export function apply(ctx: Context, config: Config): void {
       login: login.status,
       activeAccounts: pool.activeCount(now),
       meter: meter.snapshot(),
+      cache: requestStats.view(forSessionId),
       accounts: rows,
     }
   }
@@ -494,6 +511,9 @@ export function apply(ctx: Context, config: Config): void {
         }
         const pathname = (req.url ?? '/').split('?')[0].replace(/\/+$/, '')
         const action = pathname.slice('/api/cmdgo'.length) || '/'
+        // 会话头部传来的 sessionId：只用于把缓存台账定位到「本会话」。
+        const query = (req.url ?? '').split('?')[1] ?? ''
+        const forSessionId = new URLSearchParams(query).get('sessionId') ?? undefined
         // --- 浏览器信任 / 鉴权闸门 ---
         // 这些路由此前既无鉴权也不校验 Origin/Content-Type：恶意页面能用
         // CORS 安全列表类型（text/plain，不触发预检）跨站 POST，静默触发
@@ -523,7 +543,7 @@ export function apply(ctx: Context, config: Config): void {
         }
         try {
           if (req.method === 'GET' && (action === '/status' || action === '/')) {
-            sendJson(rawRes, 200, { ok: true, ...(await statusSnapshot()) })
+            sendJson(rawRes, 200, { ok: true, ...(await statusSnapshot(forSessionId)) })
             return
           }
           if (req.method === 'POST' && action === '/login') {
@@ -635,6 +655,18 @@ export function apply(ctx: Context, config: Config): void {
     onKeyFailure: async (apiKey, message) => {
       const account = await accountForKey(apiKey)
       if (account !== undefined) pool.reportFailure(account, message)
+    },
+    // 每次完成的请求都把用量（含缓存读 / 写）记进台账：HUD 用它能直接看出
+    // 缓存有没有命中（issue #6 的补充诉求）。
+    onRequestUsage: (usage) => { requestStats.record(usage) },
+    // 网关判「某个 tool-call 缺结果」时的自愈：丢掉它重发，让卡死的会话能继续
+    // （issue #5）。这条日志是用户判断「为什么这一轮重试了」的唯一线索。
+    onRepair: (info) => {
+      ctx.logger.warn(
+        '[cmdgo] 请求形状自愈：网关报缺工具结果，丢掉 %s 后重试（model=%s）',
+        info.toolCallIds.join(', '),
+        info.model,
+      )
     },
   })
   ctx.llm.registerConfigurableProviders([

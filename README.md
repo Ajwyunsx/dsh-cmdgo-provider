@@ -34,7 +34,9 @@ dsh plugin add github:Ajwyunsx/dsh-cmdgo-provider
   2. 「打开登录页」→ 浏览器完成授权；
   3. Studio 页面 POST `{apiKey, state, userId, userName, keyName}` 回本机 `/callback`，state 校验通过后 API Key 自动写入凭据存储（默认 `COMMANDCODE_API_KEY`），面板显示等待回调 → 已登录。
 - **右上角额度 HUD**：会话头部右侧的紧凑胶囊显示「最紧的那条额度」+ 账号数，点开是全部账号的额度浮层，并可直接「＋ 添加账号」——见 [右上角额度 HUD](#右上角额度-hud070)。
-- **HTTP API**：`GET /api/cmdgo/status`、`POST /api/cmdgo/login|cancel|logout`、`POST /api/cmdgo/account/toggle|remove`、`POST /api/cmdgo/usage/refresh`。
+- **缓存台账**：HUD 里展示每次请求的缓存读 / 写 token 与命中率（按会话聚合）——见 [会话标识与缓存台账](#会话标识与缓存台账090)。
+- **请求自愈**：历史里出现网关认为「缺工具结果」的形状时，自动丢掉被点名的调用后用**同一个账号**重发一次，会话不会被永久卡死——见 [工具调用双射与请求自愈](#工具调用双射与请求自愈090)。
+- **HTTP API**：`GET /api/cmdgo/status`（可带 `?sessionId=` 取本会话缓存台账）、`POST /api/cmdgo/login|cancel|logout`、`POST /api/cmdgo/account/toggle|remove`、`POST /api/cmdgo/usage/refresh`。
 
 ## 多账号池（0.2.0+）
 
@@ -108,6 +110,62 @@ dsh plugin add github:Ajwyunsx/dsh-cmdgo-provider
 - **跨重启保留**：计数、基线与样本落在 `~/.dsh/cmdgo-meter.json`，重启不清零。
 - **口径提醒**：不同模型 / 上下文长度 / 思考强度的单次消耗差异很大，所以这是
   **理论上限**（按你近期的实测均值推算），不是承诺值。
+
+## 会话标识与缓存台账（0.9.0+）
+
+上游网关对 `x-session-id` 是**认格式**的（同类适配器里缺会话头会直接
+`400 MissingSessionID`），而它决定的是**会话级缓存亲和**：同一个会话的续写 /
+重试复用上游缓存（系统提示与前缀不必重新计费），不同会话不该互相同一条缓存。
+
+**0.8.x 及更早的问题（#6）**：发出去的是 `cli-<ISO 时间戳>`——既没有官方 CLI 的
+`sess_` 字头、形状也不同，而且是**整进程一个常量**，把互不相干的对话钉到同一个
+缓存群。官方 CLI 的 bundle 里是：
+
+```js
+const generateSessionId = () => `sess_${randomUUID().replace(/-/g, '').substring(0, 16)}`
+```
+
+**0.9.0 起**：
+
+- 形状对齐官方：`sess_<16 位小写十六进制>`；
+- **按会话派生**：`sess_ + sha256(harness sessionId) 前 16 位`。同一个对话的续写 /
+  重试 / 重发是**同一个 id**（缓存亲和保住了），不同对话互不相同；
+- harness 没盖会话身份时（一次性调用）退回进程级常量，保持 CLI 的"一次进程一个 id"语义。
+
+**缓存台账**（同步解决 #6 的补充诉求）：此前插件只把 usage 喂给 token 计量，
+用户看不到缓存到底有没有命中，也就无法验证上面的对齐是否生效。现在每次完成的请求
+都会把 `cacheReadTokens` / `cacheWriteTokens` 记进内存台账（`request-stats.ts`）：
+
+- **胶囊**：本会话有缓存数据时多一个 `⤢NN%` 命中指示器（它就长在会话头部，天然是"本会话"）；
+- **面板**：多一行「缓存台账」——本会话一行（`N 次请求 · 输入 … · 缓存读 … · 缓存写 … · 命中 NN%`）、
+  最近一次请求的模型与时间、进程内累计、以及最近几个会话的对比；
+- **不编数字**：网关不报缓存字段时显示「网关未报缓存字段」，命中率分母只算真的报了缓存的请求；
+  宿主是旧版（无 `cache` 字段）时显示「需要宿主 0.9.0」；
+- 会话只以 8 位哈希标签出现，完整 sessionId 不出现在快照里；台账纯内存、不落盘、含上限淘汰。
+
+## 工具调用双射与请求自愈（0.9.0+）
+
+网关对请求形状有一条**硬校验**：assistant 消息里的每个 `tool-call` 必须**恰好**有
+一条同 id 的 `tool-result`；不满足就整轮
+`{"type":"error","error":{"type":"server_error","message":"Tool result is missing for tool call …"}}`
+（不带 `finish-step`）。麻烦之处在于：坏形状**写在历史里**，于是之后每一轮请求都会
+把它重发一遍——会话就永久卡死了（#5 的现场：并行读多张图那一轮的调用 id 撞了）。
+
+0.9.0 把这条不变量修在**发出之前**，并加了一条兜底：
+
+1. **严格双射**：没有结果的孤儿调用丢掉（0.6.3 已有）、没有调用的孤儿结果也丢掉、
+   同一个 id 两侧都只发一次。三件事合起来，请求里不可能再出现"缺结果"的形状。
+2. **流内 id 唯一化**：网关不给 id 时按块下标合成（`call-<index>`）；同一个 id 连发两次
+   且载荷完全相同 → 判定为重复投递，**丢掉**（不让工具被执行两次）；载荷不同 →
+   追加 `-2` 后缀区分，保住这次真实调用。harness 的组装器是**按块下标**组装的，
+   所以同 id 的两个块会长成两个同 id 的调用、两个同 id 的结果——正是网关报错的形状。
+3. **自愈重试**：万一还是被网关点名（例如网关记的 id 与我们发的不一致），
+   adapter 会把被点名的 id 从请求里**两侧一起丢掉**后用**同一个账号**重发一次
+   （不切账号 → 不烧别的账号额度；不消耗故障转移预算），并通过
+   `onRepair` 记一条 `[cmdgo] 请求形状自愈：…` 日志。
+   只对**这一轮真的发出去了的调用**生效：点名我们没发过的 id 时不做无谓重发。
+4. **不重放半截回答**：已经流出内容后才出错时照旧直接失败——自愈只发生在"一个字都没发出去"的请求上。
+5. 被丢掉的结果里嵌的图片也一并不发（否则会冒出一张没有上下文的图）。
 
 ## 多模态 / 图像输入（0.6.0+）
 
@@ -198,7 +256,17 @@ DSH 运行期间打开一个恶意页面，它就能静默调用：
 
 ## 协议实现
 
-请求信封与流式解析对齐官方 CLI（`x-command-code-version`、NDJSON 事件流 text-delta / reasoning-delta / tool-call / finish-step）。请求指纹完整复刻官方 `cmd` CLI（v1.31.0 实测还原）：`User-Agent: commandcode/<version>` + `x-command-code-version` / `x-cli-environment: production` / `x-taste-learning` / `x-session-id` / `x-project-slug`，反代流量与 CLI 本体在网关上不可区分，参考了 [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)、[synthetic-coworkers/cmdcode2api](https://github.com/synthetic-coworkers/cmdcode2api) 与 [jiesou/dsh-commandcode-go-provider](https://github.com/jiesou/dsh-commandcode-go-provider)。
+请求信封与流式解析对齐官方 CLI（`x-command-code-version`、NDJSON 事件流 text-delta / reasoning-delta / tool-call / finish-step）。请求指纹对齐官方 `cmd` CLI（v1.31.0 实测还原）：`User-Agent: commandcode/<version>` + `x-command-code-version` / `x-cli-environment: production` / `x-taste-learning` / `x-project-slug`，反代流量与 CLI 本体在网关上不可区分，参考了 [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)、[synthetic-coworkers/cmdcode2api](https://github.com/synthetic-coworkers/cmdcode2api) 与 [jiesou/dsh-commandcode-go-provider](https://github.com/jiesou/dsh-commandcode-go-provider)。
+
+> 一处**更正**（#6）：0.8.x 及更早把 `x-session-id` 发成 `cli-<时间戳>` 形状，与官方 CLI
+> 的 `sess_<16 hex>` 不符 —— 此前 README 声称的"完整复刻"在这一项上并不成立。
+> 0.9.0 起按官方形状、按会话派生（见 [会话标识与缓存台账](#会话标识与缓存台账090)）。
+
+测试：`node scripts/smoke-protocol.mjs`（工具双射 / 流内 id / usage / session id 形状）、
+`node scripts/smoke-repair.mjs`（自愈重试端到端，含假网关）、
+`node scripts/smoke-request-stats.mjs`（缓存台账聚合）、
+`node scripts/smoke-meter.mjs`（调用计量）、`node scripts/smoke-client.mjs`（客户端 bundle 渲染）。
+`npm run smoke` 一次跑完。
 
 ## 配置
 
@@ -245,6 +313,12 @@ DSH 运行期间打开一个恶意页面，它就能静默调用：
   中断时常见），从源头避免这类请求。真截断仍报 `STREAM_CLOSED`，但会带上收到的
   事件数便于诊断。错误分类为 `INVALID_REQUEST` 的请求**不会**触发账号故障转移，
   避免拿一个必然失败的请求去烧其它账号的额度。
+
+- **`Tool result is missing for tool call …`，而且之后每一轮都秒失败**（#5）：坏形状
+  写在历史里，每轮重发。0.9.0 起有两层防护：发出前保证工具调用 / 结果严格双射
+  （孤儿调用、孤儿结果、重复 id 全部处理掉），以及被网关点名时的**同账号自愈重试**
+  （丢掉被点名的调用后重发，日志里会出现 `[cmdgo] 请求形状自愈：…`）。
+  若你看到重试后仍然失败，把那条日志和当时的工具调用一起反馈。
 
 - **装完不显示**：`dsh plugin add` 只写 profile 清单，运行中的 loader 需要重启（或热装配工具）才会加载；另外检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否残留同 id 的 `disabled: true` 条目——卸载器会写它阻断自装配，重装前应删除。
 - **模型列表为空（显示 0）**：目录来自 `https://api.commandcode.ai/provider/v1/models`（免鉴权）。

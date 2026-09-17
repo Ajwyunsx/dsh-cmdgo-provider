@@ -22,18 +22,21 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import type {
+  ContentBlock,
   GenerateOptions,
   LlmModelInfo,
   LlmModelReasoningInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
+  Message,
   ResolvedRetryPolicy,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+import { createHash, randomUUID } from 'node:crypto'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
-import { buildRequest, CC_VERSION, DEFAULT_MAX_TOKENS, eventToChunks, gatewayErrorMessage, parseEventStream, streamErrorCode, streamErrorText } from './protocol.js'
-import type { CcStreamState, ImageResolver } from './protocol.js'
+import { buildRequest, CC_VERSION, DEFAULT_MAX_TOKENS, eventToChunks, gatewayErrorMessage, parseEventStream, streamErrorCode, streamErrorText, usageSummary } from './protocol.js'
+import type { CcStreamState, CcUsageSummary, ImageResolver, RequestRepair } from './protocol.js'
 import type { ModelInputModality } from './models.js'
 
 /** One catalog model advertised by the adapter. */
@@ -86,18 +89,61 @@ export interface CommandCodeGoAdapterOptions {
    * instead of vanishing.
    */
   resolveImage?: ImageResolver
+  /** Report one completed request's token usage (cache reads/writes included). */
+  onRequestUsage?: (usage: CommandCodeGoRequestUsage) => void
+  /**
+   * A request was rejected for a broken tool-call/tool-result shape and is being
+   * retried with the offending call dropped (self-heal). Reported once per heal.
+   */
+  onRepair?: (info: CommandCodeGoRepairInfo) => void
+}
+
+/** One completed request's token usage, attributed to its conversation. */
+export interface CommandCodeGoRequestUsage extends CcUsageSummary {
+  /** Harness model id the request was addressed to. */
+  model: string
+  /** Harness session identity, when the loop stamped one. */
+  sessionId?: string
+  /** When the gateway finished reporting this request. */
+  at: number
+}
+
+/** One self-heal decision: the gateway named these tool-call ids as missing results. */
+export interface CommandCodeGoRepairInfo {
+  /** Tool-call ids dropped from the retried request. */
+  toolCallIds: readonly string[]
+  /** The gateway's own error text (verbatim, for logs). */
+  message: string
+  /** Harness model id the failed request was addressed to. */
+  model: string
 }
 
 /** Hard cap on same-request key failovers, even for very large pools. */
 const MAX_FAILOVER_ATTEMPTS = 4
 
+/** Hard cap on history self-heals (drop a gateway-named tool call and retry). */
+const MAX_REPAIR_ATTEMPTS = 4
+
 /**
- * CLI-shaped session id: `cli-<YYYY-MM-DDTHH-mm-ss>`, mirroring the id the
- * official `cmd` CLI mints per session (used in `x-session-id`). Process
- * scoped: all pooled accounts share one id per harness process, exactly like
- * one CLI process would.
+ * Official CLI session-id shape: `sess_<16 lowercase hex>`, minted once per CLI
+ * process by `generateSessionId()` (`sess_${randomUUID().replace(/-/g,'').substring(0,16)}`).
+ *
+ * 早先这里发的是 `cli-<ISO 时间戳>`：既没有 `sess_` 字头、形状也和 CLI 不同，
+ * 而上游网关对 `x-session-id` 是做格式识别/会话级缓存亲和的（同类适配器的社区
+ * 先例里，缺会话头会直接 400 MissingSessionID）。issue #6 报告了这一点。
+ *
+ * 额外的语义修正：CLI 是**一会话一 id**（同一次进程里所有请求复用），所以本
+ * 适配器按 harness 的会话身份派生成稳定 id —— 同一个对话的续写/重试复用同一个
+ * id（保住缓存亲和），不同对话互不串味（旧实现整进程共用一个 id）。harness 没
+ * 盖会话身份时（一次性调用）退回进程级常量，保持 CLI 的行为。
  */
-const SESSION_ID = `cli-${new Date().toISOString().replace(/\.\d{3}Z$/, '').replace(/:/g, '-')}`
+const PROCESS_SESSION_ID = `sess_${randomUUID().replace(/-/g, '').slice(0, 16)}`
+
+/** 会话身份 → 官方形状的稳定 session id（16 位小写十六进制）。 */
+export function cliSessionIdFor(sessionId: string | undefined): string {
+  if (sessionId === undefined || sessionId.length === 0) return PROCESS_SESSION_ID
+  return `sess_${createHash('sha256').update(sessionId).digest('hex').slice(0, 16)}`
+}
 
 /**
  * CLI-shaped project slug: the official CLI derives `x-project-slug` from the
@@ -106,8 +152,8 @@ const SESSION_ID = `cli-${new Date().toISOString().replace(/\.\d{3}Z$/, '').repl
  */
 const PROJECT_SLUG = 'dsh-cmdgo'
 
-function buildCliSessionId(): string {
-  return SESSION_ID
+function buildCliSessionId(sessionId: string | undefined): string {
+  return cliSessionIdFor(sessionId)
 }
 
 function buildProjectSlug(): string {
@@ -254,23 +300,48 @@ export class CommandCodeGoAdapter extends LlmAdapter {
    * rate limit, server, transport) fail over to another account inside the
    * same request. Once streaming has started, errors propagate unchanged —
    * a half-delivered answer must never be silently replayed.
+   *
+   * 另一条独立的容错路径是**历史自愈**：网关判请求形状不合法（点名某个
+   * tool-call 缺结果）时，历史里的坏形状会被每一轮重发，会话永久卡死
+   * （issue #5）。这里把网关点名的调用丢掉后用**同一个账号**重发一次——
+   * 不切账号，所以不会烧别的账号额度，只是让这个会话能继续。
    */
   async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const connection = this.config.options()
     const attempts = Math.max(1, Math.min(this.config.poolSize?.() ?? 1, MAX_FAILOVER_ATTEMPTS))
+    const dropped = new Set<string>()
+    // 只修「这一轮真的发出去的调用」：网关点名的 id 不在请求里时，删掉它什么也
+    // 改变不了，重发纯属浪费额度（现场见 issue #5 的 id 就是我们发出去的那个）。
+    const declared = declaredToolCallIds(options.messages)
+    let repairs = 0
+    // key 在循环外解析，**自愈重试因此复用同一个账号**（池化时 resolveApiKey 每次
+    // 调用都会轮询到下一个账号，不能靠"再解析一次"来保持同号）。
+    let apiKey = await this.config.resolveApiKey()
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const apiKey = await this.config.resolveApiKey()
       const mayFailover = attempt < attempts - 1
       let yielded = false
       try {
-        for await (const chunk of this.open(options, connection, apiKey)) {
+        for await (const chunk of this.open(options, connection, apiKey, dropped)) {
           yielded = true
           yield chunk
         }
         return
       } catch (error: unknown) {
+        // 只修「一个字都没发出去」的请求：已经流出的内容不能悄悄重放。
+        const named = yielded ? [] : missingToolCallIds(error)
+        const fresh = named.filter(id => declared.has(id) && !dropped.has(id))
+        if (fresh.length > 0 && repairs < MAX_REPAIR_ATTEMPTS) {
+          for (const id of fresh) dropped.add(id)
+          repairs += 1
+          this.fireRepair({ toolCallIds: fresh, message: messageOf(error), model: options.model })
+          // 自愈重试不消耗故障转移预算：attempt-- 与循环自增相抵，apiKey 不变。
+          attempt -= 1
+          continue
+        }
         if (yielded || !mayFailover || !isFailoverError(error)) throw error
-        this.fireKeyFailure(apiKey, error instanceof Error ? error.message : String(error))
+        this.fireKeyFailure(apiKey, messageOf(error))
+        // 真正的故障转移：换到下一个账号再试。
+        apiKey = await this.config.resolveApiKey()
       }
     }
   }
@@ -280,17 +351,22 @@ export class CommandCodeGoAdapter extends LlmAdapter {
     options: GenerateOptions,
     connection: CommandCodeGoConnectionOptions,
     apiKey: string,
+    dropToolCallIds?: ReadonlySet<string>,
   ): AsyncIterable<StreamChunk> {
     const consumer = new AbortController()
     const upstream = options.signal === undefined
       ? consumer.signal
       : AbortSignal.any([options.signal, consumer.signal])
     using watchdog = idleWatchdog(upstream, DEFAULT_STREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_CODE)
+    const repair: RequestRepair | undefined = dropToolCallIds === undefined || dropToolCallIds.size === 0
+      ? undefined
+      : { dropToolCallIds }
     const iterator = this.request(
       options,
       watchdog.signal,
       connection,
       apiKey,
+      repair,
     )[Symbol.asyncIterator]()
     let exhausted = false
     try {
@@ -331,24 +407,49 @@ export class CommandCodeGoAdapter extends LlmAdapter {
     void Promise.resolve(this.config.onKeyFailure?.(apiKey, message)).catch(() => {})
   }
 
+  private fireRepair(info: CommandCodeGoRepairInfo): void {
+    try {
+      this.config.onRepair?.(info)
+    } catch (_repairObserverFailure) {
+      // 观测回调不影响重试本身。
+    }
+  }
+
+  /** 上报一次请求的用量（缓存读写一并带上），供宿主做缓存展示。 */
+  private fireUsage(usage: CcUsageSummary, options: GenerateOptions): void {
+    const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
+    try {
+      this.config.onRequestUsage?.({
+        ...usage,
+        model: options.model,
+        ...sessionId === undefined || sessionId.length === 0 ? {} : { sessionId },
+        at: Date.now(),
+      })
+    } catch (_usageObserverFailure) {
+      // 观测回调不影响流本身。
+    }
+  }
+
   private async * request(
     options: GenerateOptions,
     signal: AbortSignal,
     connection: CommandCodeGoConnectionOptions,
     apiKey: string,
+    repair?: RequestRepair,
   ): AsyncIterable<StreamChunk> {
-    const body = await buildRequest(options, this.config.resolveImage)
+    const body = await buildRequest(options, this.config.resolveImage, repair)
     const payload = JSON.stringify(body)
     const headers: Record<string, string> = {
       'content-type': 'application/json',
-      // 请求指纹完全对齐官方 cmd CLI（v1.31.0 实测还原）：
+      // 请求指纹对齐官方 cmd CLI（v1.31.0 实测还原）：
       // UA 是 commandcode/<版本>，配合 x-command-code-version / x-cli-environment /
       // x-taste-learning / x-session-id / x-project-slug，反代流量与 CLI 本体不可区分。
+      // x-session-id 用官方的 `sess_<16 hex>` 形状，并按 harness 会话身份派生（见 cliSessionIdFor）。
       'user-agent': `commandcode/${CC_VERSION}`,
       'x-command-code-version': CC_VERSION,
       'x-cli-environment': 'production',
       'x-taste-learning': 'false',
-      'x-session-id': buildCliSessionId(),
+      'x-session-id': buildCliSessionId(options.sessionId === undefined ? undefined : String(options.sessionId)),
       'x-project-slug': buildProjectSlug(),
       'authorization': `Bearer ${apiKey}`,
       ...attributionHeaders(),
@@ -411,6 +512,11 @@ export class CommandCodeGoAdapter extends LlmAdapter {
       if (event.type === 'text-start' || event.type === 'reasoning-start' || event.type === 'tool-call') {
         state.blockIndex += 1
       }
+      // 用量在事件转 chunk 之前先取一份给宿主（缓存读写要能显示出来，issue #6）。
+      if (event.type === 'finish-step' || event.type === 'finish') {
+        const usage = usageSummary(event)
+        if (usage !== undefined) this.fireUsage(usage, options)
+      }
       yield* eventToChunks(event, state)
       // finish-step 或 finish 任一到达都表示本轮已正常结束。
       if (state.finished === true) return
@@ -424,6 +530,41 @@ export class CommandCodeGoAdapter extends LlmAdapter {
       'STREAM_CLOSED',
     )
   }
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** 本轮请求里 assistant 声明过的工具调用 id（自愈只针对这些 id）。 */
+function declaredToolCallIds(messages: readonly Message[]): Set<string> {
+  const ids = new Set<string>()
+  const walk = (blocks: readonly ContentBlock[]): void => {
+    for (const block of blocks) {
+      if (block.type === 'tool-call') ids.add(block.id)
+      else if (block.type === 'tool-result') walk(block.content)
+    }
+  }
+  for (const message of messages) walk(message.content)
+  return ids
+}
+
+/**
+ * 网关在请求形状校验失败时会点名「哪个 tool-call 缺结果」，例如
+ * `Tool result is missing for tool call call_01`。这里把点名的 id 抠出来，
+ * 供自愈重试把它们两侧一起丢掉（见 `stream()`）。
+ */
+const MISSING_TOOL_RESULT_PATTERN = /tool result is missing for tool call[:\s]+["'`]?([A-Za-z0-9_.:@-]+)/gi
+
+function missingToolCallIds(error: unknown): string[] {
+  const message = messageOf(error)
+  if (!/tool result is missing/i.test(message)) return []
+  const ids: string[] = []
+  for (const match of message.matchAll(MISSING_TOOL_RESULT_PATTERN)) {
+    const id = match[1]
+    if (id !== undefined && id.length > 0 && !ids.includes(id)) ids.push(id)
+  }
+  return ids
 }
 
 /** Map a gateway HTTP status / error body to a stable harness LlmError code. */

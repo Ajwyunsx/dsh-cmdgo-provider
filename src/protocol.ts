@@ -59,11 +59,29 @@ export interface CcUsage {
   inputTokenDetails?: {
     noCacheTokens?: number
     cacheReadTokens?: number
+    /** 写入缓存的输入 token（不同网关版本可能叫 cacheCreation*）。 */
+    cacheWriteTokens?: number
+    cacheCreationTokens?: number
+    cacheCreationInputTokens?: number
   }
   outputTokenDetails?: {
     textTokens?: number
     reasoningTokens?: number
   }
+}
+
+/**
+ * 一次请求的用量摘要（派发给宿主的计量/缓存展示用）。
+ *
+ * 缓存字段**只有网关真的报了才带上**：缺失意味着「这一轮没走缓存」还是
+ * 「这个网关版本不报该字段」无法区分，编 0 会让用户误以为从未命中。
+ */
+export interface CcUsageSummary {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
 }
 
 /** Tool call inside an assistant message, as the gateway wants it. */
@@ -171,13 +189,14 @@ function toolResultOutput(
 /**
  * 序列化一条 assistant 消息。
  *
- * `resultIds` 是本轮所有工具结果的 id 集合：**没有对应结果的工具调用必须丢掉**。
+ * `pairing` 是双射视图（见 {@link ToolPairing}）：**没有对应结果的工具调用必须丢掉**，
+ * 同一个调用 id 只发一次，自愈点名过的 id 也丢掉。
  * 网关对「有 tool-call 却没有对应 tool 结果」是硬错误——实测返回
  * `{"type":"error","error":{"type":"server_error","message":"Tool result is missing for tool call …"}}`
  * 且不带 finish-step。长时间会话被压缩、或工具执行被中断时，历史里很容易出现这种
  * 孤儿调用；丢掉它比让整轮失败好。
  */
-function serializeAssistant(message: Message, resultIds?: ReadonlySet<string>): Extract<CcMessage, { role: 'assistant' }> | undefined {
+function serializeAssistant(message: Message, pairing?: ToolPairing): Extract<CcMessage, { role: 'assistant' }> | undefined {
   const parts: Extract<CcMessage, { role: 'assistant' }>['content'] = []
   for (const block of message.content) {
     if (block.type === 'text') {
@@ -185,7 +204,12 @@ function serializeAssistant(message: Message, resultIds?: ReadonlySet<string>): 
     } else if (block.type === 'reasoning') {
       parts.push({ type: 'reasoning', text: block.text })
     } else if (block.type === 'tool-call') {
-      if (resultIds !== undefined && !resultIds.has(block.id)) continue
+      if (pairing !== undefined) {
+        if (pairing.dropIds.has(block.id)) continue
+        if (!pairing.resultIds.has(block.id)) continue
+        if (pairing.emittedCalls.has(block.id)) continue
+        pairing.emittedCalls.add(block.id)
+      }
       parts.push({
         type: 'tool-call',
         toolCallId: block.id,
@@ -214,6 +238,54 @@ function collectToolResultIds(messages: readonly Message[]): Set<string> {
   return ids
 }
 
+/** 收集全部工具调用 id（assistant 消息里声明的）。 */
+function collectToolCallIds(messages: readonly Message[]): Set<string> {
+  const ids = new Set<string>()
+  const walk = (blocks: readonly ContentBlock[]): void => {
+    for (const block of blocks) {
+      if (block.type === 'tool-call') ids.add(block.id)
+      else if (block.type === 'tool-result') walk(block.content)
+    }
+  }
+  for (const message of messages) walk(message.content)
+  return ids
+}
+
+const NO_IDS: ReadonlySet<string> = new Set()
+
+/**
+ * 工具调用 / 结果的双射视图。
+ *
+ * 网关对请求形状是硬校验：assistant 里出现的每个 `tool-call` 都必须**恰好**有
+ * 一条同 id 的 `tool-result`，反之亦然。历史被压缩、工具执行中断、或网关把
+ * 同一个调用连发两次（harness 按 index 组装 → 两个同 id 的调用）都会破坏这个
+ * 不变量，而破坏之后**每一轮请求都会带着坏形状重发**，会话就永久卡死
+ * （issue #5）。这里把它修在发出前：
+ *
+ * - `resultIds`：没有结果的调用直接丢掉（避免 `Tool result is missing`）；
+ * - `callIds`：没有对应调用的结果也丢掉（反向孤儿，同样破坏形状）；
+ * - `emittedCalls` / `emittedResults`：同一个 id 两侧都只发一次，让双射成立；
+ * - `dropIds`：自愈重试时被网关点名「缺结果」的 id，两侧一起丢。
+ */
+interface ToolPairing {
+  resultIds: ReadonlySet<string>
+  callIds: ReadonlySet<string>
+  dropIds: ReadonlySet<string>
+  emittedCalls: Set<string>
+  emittedResults: Set<string>
+}
+
+/** 建立一条消息列表的双射视图。 */
+function pairingFor(messages: readonly Message[], dropIds?: ReadonlySet<string>): ToolPairing {
+  return {
+    resultIds: collectToolResultIds(messages),
+    callIds: collectToolCallIds(messages),
+    dropIds: dropIds ?? NO_IDS,
+    emittedCalls: new Set(),
+    emittedResults: new Set(),
+  }
+}
+
 function safeParseJson(raw: string): unknown {
   try {
     return JSON.parse(raw)
@@ -224,13 +296,17 @@ function safeParseJson(raw: string): unknown {
 
 /**
  * Collect every image block in a message, descending into tool-result content
- * exactly like the harness's own `contentHasImage` does.
+ * exactly like the harness's own `contentHasImage` does — but only for tool
+ * results that survive serialization (`kept`), so an image never rides into the
+ * request without the result that carried it.
  */
-function collectImages(blocks: ContentBlock[]): ImageBlock[] {
+function collectImages(blocks: ContentBlock[], kept?: ReadonlySet<ContentBlock>): ImageBlock[] {
   const found: ImageBlock[] = []
   for (const block of blocks) {
     if (block.type === 'image') found.push(block)
-    else if (block.type === 'tool-result') found.push(...collectImages(block.content))
+    else if (block.type === 'tool-result' && (kept === undefined || kept.has(block))) {
+      found.push(...collectImages(block.content, kept))
+    }
   }
   return found
 }
@@ -268,16 +344,33 @@ async function imageParts(blocks: ImageBlock[], resolveImage?: ImageResolver): P
  * what the gateway expects for ordinary chat turns. Images nested in
  * tool-result content ride in that follow-up user message — the tool message
  * itself is text-only.
+ *
+ * `pairing` 会把「没有对应工具调用的结果」和重复 id 丢掉：网关要求双向配对，
+ * 反向孤儿同样会让整轮失败。被丢掉的结果里嵌的图片也一并不发（见 collectImages）。
  */
-async function serializeUser(message: Message, resolveImage?: ImageResolver): Promise<CcMessage[]> {
+async function serializeUser(
+  message: Message,
+  resolveImage?: ImageResolver,
+  pairing?: ToolPairing,
+): Promise<CcMessage[]> {
   const out: CcMessage[] = []
-  const toolResults = message.content.filter(
-    (block): block is Extract<ContentBlock, { type: 'tool-result' }> => block.type === 'tool-result',
-  )
-  if (toolResults.length > 0) {
+  const kept: Array<Extract<ContentBlock, { type: 'tool-result' }>> = []
+  const keptBlocks = new Set<ContentBlock>()
+  for (const block of message.content) {
+    if (block.type !== 'tool-result') continue
+    if (pairing !== undefined) {
+      if (pairing.dropIds.has(block.toolCallId)) continue
+      if (!pairing.callIds.has(block.toolCallId)) continue
+      if (pairing.emittedResults.has(block.toolCallId)) continue
+      pairing.emittedResults.add(block.toolCallId)
+    }
+    keptBlocks.add(block)
+    kept.push(block)
+  }
+  if (kept.length > 0) {
     out.push({
       role: 'tool',
-      content: toolResults.map(result => ({
+      content: kept.map(result => ({
         type: 'tool-result' as const,
         toolCallId: result.toolCallId,
         toolName: 'unknown',
@@ -286,7 +379,7 @@ async function serializeUser(message: Message, resolveImage?: ImageResolver): Pr
     })
   }
   const text = flattenText(message.content)
-  const images = await imageParts(collectImages(message.content), resolveImage)
+  const images = await imageParts(collectImages(message.content, keptBlocks), resolveImage)
   if (text.length > 0 || images.length > 0) {
     const parts: CcUserPart[] = [
       ...(text.length > 0 ? [{ type: 'text' as const, text }] : []),
@@ -304,32 +397,45 @@ async function serializeUser(message: Message, resolveImage?: ImageResolver): Pr
 }
 
 /**
+ * 自愈参数：网关点名「缺结果」的工具调用 id，两侧一起丢掉再重发一次。
+ *
+ * 只在已经确认了**请求形状**不合法时使用：历史里的坏形状无法靠本机推断完全
+ * 消除（例如网关记的 id 与我们发的不一致），由网关点名最可靠。
+ */
+export interface RequestRepair {
+  dropToolCallIds?: ReadonlySet<string>
+}
+
+/**
  * Build the gateway request envelope for one harness call.
  *
  * @param options - harness call options.
  * @param resolveImage - optional resolver turning harness image attachments
  * into gateway data URLs. Without it images degrade to an explicit placeholder
  * instead of being dropped.
+ * @param repair - optional self-heal instruction (see {@link RequestRepair}).
  */
 export async function buildRequest(
   options: GenerateOptions,
   resolveImage?: ImageResolver,
+  repair?: RequestRepair,
 ): Promise<CcRequestEnvelope> {
   let system = options.system ?? ''
   const messages: CcMessage[] = []
-  // 先扫一遍工具结果：孤儿工具调用会被 drop（见 serializeAssistant）。
-  const resultIds = collectToolResultIds(options.messages)
+  // 先建立工具调用/结果的双射视图：孤儿调用、孤儿结果、重复 id 都在这里被丢掉
+  // （见 ToolPairing 与 issue #5）。
+  const pairing = pairingFor(options.messages, repair?.dropToolCallIds)
   for (const message of options.messages) {
     if (message.role === 'system') {
       system += (system ? '\n\n' : '') + flattenText(message.content)
       continue
     }
     if (message.role === 'assistant') {
-      const serialized = serializeAssistant(message, resultIds)
+      const serialized = serializeAssistant(message, pairing)
       if (serialized !== undefined) messages.push(serialized)
       continue
     }
-    messages.push(...await serializeUser(message, resolveImage))
+    messages.push(...await serializeUser(message, resolveImage, pairing))
   }
 
   const tools: CcTool[] = (options.tools ?? [])
@@ -378,6 +484,68 @@ export interface CcStreamState {
   blockIndex: number
   /** 已产出 finish 块（finish-step 或 finish 都可能先到，只认第一个）。 */
   finished?: boolean
+  /** 本流已发出的工具调用 id → 载荷指纹（去重与唯一化用，见 resolveToolCallId）。 */
+  toolCallIds?: Map<string, string>
+}
+
+/**
+ * 为一条 `tool-call` 事件定一个**流内唯一**的 id。
+ *
+ * 网关不保证 id 存在，更不保证唯一，而 harness 的组装器是**按 block index**
+ * 组装的（`dsh-llm` 的 BlockAssembler）：同一个 id 出现两次就会长出两个同 id 的
+ * 调用块、两个同 id 的结果，网关随后判
+ * `Tool result is missing for tool call …`（issue #5 的现场）。所以：
+ *
+ * - 缺 id → 按 block index 合成（与 harness 自己的 `call-<index>` 兜底同形）；
+ * - 同 id 且载荷完全相同 → 判定为网关重复投递，返回 undefined（调用方丢弃该事件），
+ *   这样不会让工具被执行两次；
+ * - 同 id 但载荷不同 → 追加 `-2`/`-3` 后缀区分，保住这次真实调用。
+ */
+function resolveToolCallId(state: CcStreamState, declared: string, fingerprint: string): string | undefined {
+  const seen = state.toolCallIds ?? (state.toolCallIds = new Map<string, string>())
+  const base = declared.length > 0 ? declared : `call-${state.blockIndex}`
+  let candidate = base
+  for (let suffix = 2; ; suffix++) {
+    const known = seen.get(candidate)
+    if (known === undefined) {
+      seen.set(candidate, fingerprint)
+      return candidate
+    }
+    if (known === fingerprint) return undefined
+    candidate = `${base}-${suffix}`
+  }
+}
+
+/**
+ * 从 finish / usage 事件里取用量摘要。
+ *
+ * 字段解读沿用旧的 eventToChunks 逻辑：`inputTokens` 是**未命中缓存**的输入
+ * （网关的 `noCacheTokens`，缺失时才用总量减缓存读）；缓存读/写按网关实际报的
+ * 字段透传，缺失就省略（不编 0）。
+ */
+export function usageSummary(event: CcStreamEvent): CcUsageSummary | undefined {
+  const usage = isRecord(event.usage)
+    ? event.usage as unknown as CcUsage
+    : isRecord(event.totalUsage) ? event.totalUsage as unknown as CcUsage : undefined
+  if (usage === undefined) return undefined
+  const inputDetails = isRecord(usage.inputTokenDetails) ? usage.inputTokenDetails : undefined
+  const outputDetails = isRecord(usage.outputTokenDetails) ? usage.outputTokenDetails : undefined
+  const cacheRead = inputDetails?.cacheReadTokens
+  const cacheWrite = inputDetails?.cacheWriteTokens
+    ?? inputDetails?.cacheCreationTokens
+    ?? inputDetails?.cacheCreationInputTokens
+  const totalInput = usage.inputTokens
+  const noCache = inputDetails?.noCacheTokens
+  const inputTokens = noCache ?? (totalInput !== undefined && cacheRead !== undefined
+    ? Math.max(0, totalInput - cacheRead)
+    : totalInput) ?? 0
+  return {
+    inputTokens,
+    outputTokens: usage.outputTokens ?? outputDetails?.textTokens ?? 0,
+    ...cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {},
+    ...cacheWrite !== undefined ? { cacheWriteTokens: cacheWrite } : {},
+    ...outputDetails?.reasoningTokens !== undefined ? { reasoningTokens: outputDetails.reasoningTokens } : {},
+  }
 }
 
 /**
@@ -464,15 +632,20 @@ export function eventToChunks(
     }
     case 'tool-call': {
       const input = event.input ?? event.args ?? event.arguments
-      const callId = typeof event.toolCallId === 'string' ? event.toolCallId
+      const declared = typeof event.toolCallId === 'string' ? event.toolCallId
         : typeof event.id === 'string' ? event.id
           : ''
+      const name = typeof event.toolName === 'string' ? event.toolName : ''
+      const argumentsDelta = JSON.stringify(input ?? {})
+      const id = resolveToolCallId(state, declared, `${name}\u0000${argumentsDelta}`)
+      // undefined = 同一个调用的重复投递，丢掉（见 resolveToolCallId）。
+      if (id === undefined) break
       chunks.push({
         type: 'tool-call-delta',
         index: state.blockIndex,
-        id: callId as ToolCallChunkId,
-        ...typeof event.toolName === 'string' ? { name: event.toolName } : {},
-        argumentsDelta: JSON.stringify(input ?? {}),
+        id: id as ToolCallChunkId,
+        ...name.length > 0 ? { name } : {},
+        argumentsDelta,
       })
       break
     }
@@ -483,29 +656,8 @@ export function eventToChunks(
     case 'finish': {
       if (state.finished === true) break
       state.finished = true
-      const usage = isRecord(event.usage)
-        ? event.usage as unknown as CcUsage
-        : isRecord(event.totalUsage) ? event.totalUsage as unknown as CcUsage : undefined
-      if (usage) {
-        const inputDetails = isRecord(usage.inputTokenDetails) ? usage.inputTokenDetails : undefined
-        const outputDetails = isRecord(usage.outputTokenDetails) ? usage.outputTokenDetails : undefined
-        const cacheRead = inputDetails?.cacheReadTokens
-        const totalInput = usage.inputTokens
-        const noCache = inputDetails?.noCacheTokens
-        const inputTokens = noCache ?? (totalInput !== undefined && cacheRead !== undefined
-          ? Math.max(0, totalInput - cacheRead)
-          : totalInput) ?? 0
-        const outputTokens = usage.outputTokens ?? outputDetails?.textTokens ?? 0
-        chunks.push({
-          type: 'usage',
-          usage: {
-            inputTokens,
-            outputTokens,
-            ...cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {},
-            ...outputDetails?.reasoningTokens !== undefined ? { reasoningTokens: outputDetails.reasoningTokens } : {},
-          },
-        })
-      }
+      const usage = usageSummary(event)
+      if (usage !== undefined) chunks.push({ type: 'usage', usage })
       const reason = event.finishReason ?? event.rawFinishReason ?? 'stop'
       chunks.push({ type: 'finish', reason: mapFinishReason(reason) })
       break

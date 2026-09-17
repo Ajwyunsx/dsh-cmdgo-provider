@@ -72,9 +72,23 @@ const status = {
       },
     },
   ],
+  // 缓存台账（issue #6 补充诉求）：宿主按会话聚合后回给面板。
+  cache: {
+    last: {
+      model: 'deepseek-v4.1-flash', at: Date.now() - 3000,
+      inputTokens: 200, outputTokens: 20,
+      cacheReadTokens: 1800, cacheWriteTokens: 100,
+      cacheHitRate: 1800 / 2100, cacheReported: true,
+    },
+    total: { requests: 2, inputTokens: 200, outputTokens: 20, cacheReadTokens: 1800, cacheWriteTokens: 100, cacheReportedRequests: 2 },
+    sessions: [{ label: 'abc12345', requests: 2, inputTokens: 200, outputTokens: 20, cacheReadTokens: 1800, cacheWriteTokens: 100, cacheReportedRequests: 2, model: 'deepseek-v4.1-flash', updatedAt: Date.now() - 3000 }],
+    current: { label: 'abc12345', requests: 2, inputTokens: 200, outputTokens: 20, cacheReadTokens: 1800, cacheWriteTokens: 100, cacheReportedRequests: 2, model: 'deepseek-v4.1-flash', updatedAt: Date.now() - 3000 },
+  },
 }
 
+const fetchedUrls = []
 const fakeFetch = async (url) => {
+  fetchedUrls.push(String(url))
   if (!String(url).startsWith('/api/cmdgo/')) throw new Error('unexpected url ' + url)
   return { ok: true, status: 200, text: async () => JSON.stringify(status) }
 }
@@ -235,6 +249,49 @@ renderPanel()
 await settle()
 check('remaining 缺失时该列整体不渲染（不出现 剩$—）', !/剩\$—/.test(JSON.stringify(renderPanel())))
 status.accounts[0].usage.weekly = savedWeekly
+
+console.log('[4h] 缓存台账（issue #6 补充诉求）')
+// 会话头部的胶囊会把 sessionId 写进共享 store，面板据此带 ?sessionId= 拉本会话台账。
+const pillSession = bySlot['conversation.session.header.utilities'].component({ sessionId: 'sess_xyz' })
+const t4hPill = JSON.stringify(pillSession)
+// 胶囊里那个紧凑指示器：一个 cmdgo-hud-num span，文案以命中率结尾（箭头字符不写死）。
+const compactCache = Array.isArray(pillSession.props.children)
+  && pillSession.props.children.some((child) => child && child.props
+    && child.props.className === 'cmdgo-hud-num'
+    && typeof child.props.children === 'string' && child.props.children.endsWith('86%'))
+check('胶囊显示本会话缓存命中率', compactCache === true, t4hPill)
+check('胶囊 tooltip 说明本会话缓存命中', t4hPill.includes('本会话缓存命中 86%'))
+renderPanel()
+await settle()
+const t4h = JSON.stringify(renderPanel())
+check('面板带 sessionId 拉取本会话台账',
+  fetchedUrls.some((u) => u.includes('/status?sessionId=sess_xyz')), fetchedUrls.slice(-3).join(' | '))
+check('面板含「缓存台账」', t4h.includes('缓存台账'))
+check('面板含「本会话」行', t4h.includes('本会话（abc12345）'))
+check('本会话行含命中率 86%', t4h.includes('命中 86%'), t4h.slice(t4h.indexOf('本会话'), t4h.indexOf('本会话') + 160))
+check('本会话行含缓存读 1.8k', t4h.includes('缓存读 1.8k'))
+check('本会话行含缓存写 100', t4h.includes('缓存写 100'))
+check('面板含最近一次请求行', t4h.includes('最近一次（deepseek-v4.1-flash'))
+check('面板含进程内累计', t4h.includes('进程内累计：2 次'))
+check('累计标出报告缓存字段的请求数', t4h.includes('报告缓存字段 2/2'))
+// 旧宿主（无 cache 字段）必须如实说明，而不是编数字。
+const savedCache = status.cache
+delete status.cache
+renderPanel()
+await settle()
+const t4hOld = JSON.stringify(renderPanel())
+check('旧宿主提示需要 0.9.0', t4hOld.includes('需要宿主 0.9.0'), t4hOld.slice(t4hOld.indexOf('缓存台账'), t4hOld.indexOf('缓存台账') + 120))
+// 网关没报缓存字段时直说，不给 0%。
+status.cache = {
+  last: { model: 'm', at: Date.now(), inputTokens: 12, outputTokens: 3, cacheHitRate: 0, cacheReported: false },
+  total: { requests: 1, inputTokens: 12, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, cacheReportedRequests: 0 },
+  sessions: [],
+}
+renderPanel()
+await settle()
+const t4hNoCache = JSON.stringify(renderPanel())
+check('网关未报缓存字段时如实说明', t4hNoCache.includes('网关未报缓存字段'), t4hNoCache.slice(t4hNoCache.indexOf('最近一次'), t4hNoCache.indexOf('最近一次') + 120))
+status.cache = savedCache
 
 console.log('[5] 样式注入')
 check('HUD 样式独立注入且含主题变量',
