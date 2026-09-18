@@ -19,14 +19,23 @@
  * snapshotted into `KNOWN_MODALITIES` below and refreshed live when the
  * catalog grows an id the snapshot has never seen.
  *
- * The Go membership rule mirrors the official plans/go page and the opencode
- * commandcode-go plugin:
- * - All open-source models (deepseek, moonshotai, zai-org, MiniMaxAI, xiaomi,
- *   Qwen, stepfun, tencent, nvidia, thinkingmachines, poolside).
- * - A few premium exceptions included outright: GPT-5.6 Luna, Grok 4.5, and
- *   Muse Spark 1.2 Contributor.
- * - Everything else premium (Claude, other GPTs, Gemini, Grok 4.6, Fugu
- *   Ultra, Muse Spark 1.1 / standard 1.2) is excluded.
+ * The Go membership rule is two-tiered, because neither tier alone is good
+ * enough:
+ *
+ * 1. **Fast baseline** — {@link isGoModel}'s static rule (open-source providers
+ *    in, premium brands out, a short premium exception list). It needs no extra
+ *    network call, so the model list can be published the moment the listing
+ *    lands. Its weakness is that it goes stale: it once hardcoded
+ *    `muse-spark-1.2-contributor` and silently dropped 1.3 when upstream
+ *    promoted it (#7).
+ * 2. **Authoritative overlay** — the catalog's own `Min plan` column, which the
+ *    plugin already downloads for reasoning efforts. It is applied as an
+ *    override once it arrives (in both directions: it can add a promoted model
+ *    and remove a demoted one), so upstream tier changes are picked up without
+ *    a plugin release. Models absent from the table keep the baseline verdict.
+ *
+ * Fetched live from jsDelivr so both the efforts and the plan column track the
+ * `latest` release instead of a checked-in snapshot.
  *
  * @module commandcode-go/models
  */
@@ -151,11 +160,20 @@ export function modalitiesFor(
   return KNOWN_MODALITIES[id] === 'image' ? ['text', 'image'] : ['text']
 }
 
-/** Premium models included on the Go plan outright (from docs/plans/go). */
+/**
+ * Premium models included on the Go plan outright (from docs/plans/go).
+ *
+ * This is only the **fast baseline** used before the authoritative `Min plan`
+ * column arrives; it is deliberately kept small, because every entry here is a
+ * promise upstream can invalidate with the next release (exactly what happened
+ * when Muse Spark 1.3 replaced 1.2, issue #7). The overlay below is what keeps
+ * membership correct over time.
+ */
 const GO_PREMIUM_EXCEPTIONS: ReadonlySet<string> = new Set([
   'gpt-5.6-luna',
   'xai/grok-4.5',
   'meta/muse-spark-1.2-contributor',
+  'meta/muse-spark-1.3-contributor',
 ])
 
 /** Providers whose every model is premium and therefore absent from Go. */
@@ -168,8 +186,17 @@ function hasPremiumPrefix(id: string): boolean {
   return false
 }
 
-/** Whether a model id is part of the Go plan. */
-export function isGoModel(id: string): boolean {
+/**
+ * Whether a model id is part of the Go plan.
+ *
+ * @param id - exact gateway model id.
+ * @param plan - authoritative `Min plan` verdicts parsed from the CLI catalog;
+ * when it names this id its answer wins in both directions (promotion and
+ * demotion), otherwise the static baseline decides.
+ */
+export function isGoModel(id: string, plan?: ReadonlyMap<string, boolean>): boolean {
+  const authoritative = plan?.get(id)
+  if (authoritative !== undefined) return authoritative
   if (GO_PREMIUM_EXCEPTIONS.has(id)) return true
   if (hasPremiumPrefix(id)) return false
   const slash = id.indexOf('/')
@@ -218,20 +245,79 @@ function parseEfforts(raw: string): string[] | undefined {
     .filter((part) => part.length > 0)
 }
 
-/** Parse `reference/models.md` rows into model id → effort list. */
-export function parseCatalogEfforts(markdown: string): Map<string, string[]> {
-  const byId = new Map<string, string[]>()
-  // Row shape: | `id` | Name | Context | Efforts | $/1M … | Min plan | Best for |
+/** One parsed row of the official CLI model catalog. */
+interface CatalogRow {
+  id: string
+  efforts?: string[]
+  /** Whether the `Min plan` column places this model inside the Go tier. */
+  goPlan?: boolean
+}
+
+/**
+ * Whether a `Min plan` cell names the Go tier.
+ *
+ * Observed values are `Go and above` (45 rows), `GOAT and above` (6),
+ * `Pro and above` (13) and `Max` (7). GOAT/Pro/Max are *higher* tiers, so only
+ * the Go tier (and a hypothetical `Free`) counts. The `\b` in the pattern is
+ * what keeps `GOAT and above` from matching.
+ */
+function parseGoPlan(raw: string): boolean | undefined {
+  const value = raw.trim()
+  if (value.length === 0 || value === '—' || value === '-') return undefined
+  return /^(free|go|go and above)$/i.test(value)
+}
+
+/**
+ * Split `reference/models.md` into model rows.
+ *
+ * Column shape: `| \`id\` | Name | Context | Efforts | $/1M … | Min plan | Best for |`.
+ * The document also contains unrelated tables whose first cells are headers or
+ * rules, so a row only counts when its id cell is backticked — every real model
+ * id is, and that filters out `Id (use EXACTLY this)` and `---`.
+ */
+function catalogRows(markdown: string): CatalogRow[] {
+  const rows: CatalogRow[] = []
   for (const line of markdown.split('\n')) {
     if (!line.trimStart().startsWith('|')) continue
     const cells = line.split('|').map((cell) => cell.trim())
-    const id = cells[1]?.replace(/^`|`$/g, '')
-    const efforts = cells[4]
-    if (id === undefined || efforts === undefined) continue
-    const parsed = parseEfforts(efforts)
-    if (parsed !== undefined) byId.set(id, parsed)
+    const rawId = cells[1]
+    if (rawId === undefined || !/^`.+`$/.test(rawId)) continue
+    const id = rawId.replace(/^`|`$/g, '')
+    if (id.length === 0) continue
+    rows.push({
+      id,
+      efforts: parseEfforts(cells[4] ?? ''),
+      goPlan: parseGoPlan(cells[6] ?? ''),
+    })
   }
-  return byId
+  return rows
+}
+
+/**
+ * Parse the official CLI model catalog once into both derived maps: reasoning
+ * efforts and the authoritative Go-tier verdict.
+ */
+export function parseCatalog(markdown: string): {
+  efforts: Map<string, string[]>
+  plans: Map<string, boolean>
+} {
+  const efforts = new Map<string, string[]>()
+  const plans = new Map<string, boolean>()
+  for (const row of catalogRows(markdown)) {
+    if (row.efforts !== undefined && !efforts.has(row.id)) efforts.set(row.id, row.efforts)
+    if (row.goPlan !== undefined && !plans.has(row.id)) plans.set(row.id, row.goPlan)
+  }
+  return { efforts, plans }
+}
+
+/** Parse `reference/models.md` rows into model id → effort list. */
+export function parseCatalogEfforts(markdown: string): Map<string, string[]> {
+  return parseCatalog(markdown).efforts
+}
+
+/** Parse `reference/models.md` rows into model id → is-Go-tier. */
+export function parseCatalogPlans(markdown: string): Map<string, boolean> {
+  return parseCatalog(markdown).plans
 }
 
 const DEFAULT_MODELS_URL = 'https://api.commandcode.ai/provider/v1/models'
@@ -251,6 +337,17 @@ export async function fetchCatalogEfforts(
   url: string = CATALOG_URL,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Map<string, string[]>> {
+  return (await fetchCatalog(url, fetchImpl)).efforts
+}
+
+/**
+ * Fetch the official CLI catalog once and derive both maps it carries:
+ * reasoning efforts and the authoritative Go-tier verdict per model.
+ */
+export async function fetchCatalog(
+  url: string = CATALOG_URL,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ efforts: Map<string, string[]>; plans: Map<string, boolean> }> {
   const response = await fetchImpl(url, {
     headers: { accept: 'text/markdown' },
     signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
@@ -258,7 +355,7 @@ export async function fetchCatalogEfforts(
   if (!response.ok) {
     throw new Error(`Command Code catalog answered HTTP ${response.status}`)
   }
-  return parseCatalogEfforts(await response.text())
+  return parseCatalog(await response.text())
 }
 
 /**
@@ -321,12 +418,16 @@ export function applyModalities(
 }
 
 /**
- * Fetch the full catalog and filter to Go-usable models.
+ * Fetch the provider listing **without** applying the Go rule.
+ *
+ * Keeping the unfiltered list is what lets {@link selectGoModels} be re-run
+ * once the authoritative `Min plan` column arrives and *add* a model the static
+ * baseline had excluded (#7) — a pre-filtered list could never grow back.
  *
  * @param liveModalities - optional live registry map merged over the offline
  * snapshot (see `modalitiesFor`).
  */
-export async function fetchGoModels(
+export async function fetchAllModels(
   url: string = DEFAULT_MODELS_URL,
   fetchImpl: typeof fetch = fetch,
   liveModalities?: ReadonlyMap<string, readonly string[]>,
@@ -345,14 +446,44 @@ export async function fetchGoModels(
   for (const raw of payload.data) {
     if (!isRecord(raw)) continue
     const id = nonEmptyString(raw.id)
-    if (id === undefined || !isGoModel(id)) continue
+    if (id === undefined) continue
     const name = nonEmptyString(raw.name) ?? id.split('/').pop() ?? id
     const contextWindow = positiveNumber(raw.context_length)
       ?? positiveNumber(raw.context_window)
       ?? FALLBACK_CONTEXT_WINDOW
     models.push({ id, name, contextWindow, inputModalities: modalitiesFor(id, liveModalities) })
   }
-  // Stable order keeps the diff against a persisted catalog deterministic.
-  models.sort((a, b) => a.id.localeCompare(b.id))
   return models
+}
+
+/**
+ * Apply the Go membership rule and order the result.
+ *
+ * @param models - unfiltered listing from {@link fetchAllModels}.
+ * @param plan - authoritative `Min plan` verdicts; overrides the static rule.
+ */
+export function selectGoModels(
+  models: readonly GoModel[],
+  plan?: ReadonlyMap<string, boolean>,
+): GoModel[] {
+  // Stable order keeps the diff against a persisted catalog deterministic.
+  return models
+    .filter(model => isGoModel(model.id, plan))
+    .sort((a, b) => a.id.localeCompare(b.id))
+}
+
+/**
+ * Fetch the listing and filter it to Go-usable models in one step.
+ *
+ * @param liveModalities - optional live registry map merged over the offline
+ * snapshot (see `modalitiesFor`).
+ * @param plan - optional authoritative `Min plan` verdicts.
+ */
+export async function fetchGoModels(
+  url: string = DEFAULT_MODELS_URL,
+  fetchImpl: typeof fetch = fetch,
+  liveModalities?: ReadonlyMap<string, readonly string[]>,
+  plan?: ReadonlyMap<string, boolean>,
+): Promise<GoModel[]> {
+  return selectGoModels(await fetchAllModels(url, fetchImpl, liveModalities), plan)
 }

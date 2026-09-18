@@ -31,7 +31,7 @@ import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-settings'
 import { CommandCodeGoAdapter, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from './adapter.js'
 import type { CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js'
-import { fetchCatalogEfforts, fetchGoModels } from './models.js'
+import { applyModalities, fetchAllModels, fetchCatalog, fetchCatalogModalities, hasKnownModality, selectGoModels } from './models.js'
 import { DEFAULT_STUDIO_BASE, CommandCodeLoginManager } from './oauth.js'
 import type { LoginSuccessInfo, LoginStatus } from './oauth.js'
 import { AccountPool } from './pool.js'
@@ -42,7 +42,6 @@ import { CallMeter } from './meter.js'
 import type { MeterSnapshot } from './meter.js'
 import { RequestStats } from './request-stats.js'
 import type { RequestStatsView } from './request-stats.js'
-import { applyModalities, fetchCatalogModalities, hasKnownModality } from './models.js'
 import type { GoModel } from './models.js'
 import type { ImageResolver } from './protocol.js'
 
@@ -52,7 +51,7 @@ export {
   DEFAULT_MAX_TOKENS,
 } from './adapter.js'
 export type { CommandCodeGoAdapterOptions, CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js'
-export { fetchCatalogEfforts, fetchGoModels, isGoModel, parseCatalogEfforts } from './models.js'
+export { fetchCatalog, fetchCatalogEfforts, fetchGoModels, isGoModel, parseCatalogEfforts, parseCatalogPlans, selectGoModels } from './models.js'
 export { CommandCodeLoginManager, DEFAULT_STUDIO_BASE } from './oauth.js'
 export type { LoginStatus, LoginSuccessInfo } from './oauth.js'
 export { UsageReader, normalizeUsage, resolvePlan } from './usage.js'
@@ -779,19 +778,40 @@ export function apply(ctx: Context, config: Config): void {
    * 「0 个模型」，而 dsh 会把 0 模型的供应商分组整个过滤掉。
    */
   async function sync(): Promise<void> {
-    const entries = await fetchGoModels()
+    // 目录只拉一次、且**不过滤**：官方表格到货后要能用它的档位判据重新筛选，
+    // 而预先过滤掉的模型无法再捞回来（#7）。
+    const all = await fetchAllModels()
+    if (all.length === 0) {
+      throw new Error('provider listing is empty; keeping the previous catalog')
+    }
+    let entries = selectGoModels(all)
     if (entries.length === 0) {
       throw new Error('no Go models found; keeping the previous catalog')
     }
     publish(toScanned(entries))
-    // effort 元数据尽力而为：慢或被墙都不影响已经可用的模型列表。
+    // effort 与档位来自同一张官方表，一次抓取同时得到两者。
+    // 尽力而为：慢或被墙都不影响已经可用的模型列表。
     let efforts: Map<string, string[]> | undefined
+    let plans: Map<string, boolean> | undefined
     try {
-      efforts = await fetchCatalogEfforts()
+      ({ efforts, plans } = await fetchCatalog())
     } catch (error) {
       ctx.logger.warn('[cmdgo] effort catalog scan failed: %s', error instanceof Error ? error.message : String(error))
     }
-    if (efforts !== undefined) publish(toScanned(entries, efforts))
+    // 官方 `Min plan` 列是档位的权威判据：既能把静态规则漏掉的补回来
+    // （被官方升档的模型，如 muse-spark-1.3-contributor），也能把降档的移出去，
+    // 无需等插件发版。
+    if (plans !== undefined) {
+      const overlaid = selectGoModels(all, plans)
+      if (overlaid.length === 0) {
+        ctx.logger.warn('[cmdgo] 官方档位表把所有模型都判为非 Go，沿用静态规则结果')
+      } else {
+        entries = overlaid
+        publish(toScanned(entries, efforts))
+      }
+    } else if (efforts !== undefined) {
+      publish(toScanned(entries, efforts))
+    }
     // 目录出现快照未知的模型时，才补拉实时模态注册表。
     const live = await ensureModalities(entries.map(entry => entry.id))
     if (live !== undefined) publish(toScanned(applyModalities(entries, live), efforts))
