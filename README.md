@@ -345,6 +345,28 @@ DSH 运行期间打开一个恶意页面，它就能静默调用：
   （丢掉被点名的调用后重发，日志里会出现 `[cmdgo] 请求形状自愈：…`）。
   若你看到重试后仍然失败，把那条日志和当时的工具调用一起反馈。
 
+- **「模型什么都没说，这一轮就结束了」**（#9）：网关 `HTTP 200` 且流正常以
+  `finish-step` / `finish` 结束，但整轮里既没有正文、也没有工具调用（只有
+  `reasoning-delta`，或干脆只有终态事件）。旧行为是把这一轮当**成功**返回，宿主
+  收下一个空回合，`dsh-llm-retry` 也就没有介入的机会（它只对失败码重试）。
+  0.9.2 起这一格抛 `EMPTY_RESPONSE`（该码本来就在 DSH 默认可重试集合里），
+  于是宿主会重试；判定口径比宿主自己的 `chunkHasVisibleText` 更严——**reasoning
+  不算可见输出**，因为只有思考、没有正文也没有工具调用的回合交付不了任何可用内容。
+  已经流出的 reasoning 保留（真实内容不回收），只是不再产出 `finish`。
+
+- **设置页整块消失（「设置 → CommandCode Go」不见了，stderr 也没有报错）**（#8）：
+  dsh **0.1.7** 删掉了 `settings.installSection`，而老代码无保护地调用它——那个
+  throw 会被 cordis 的 inject 回调静默吞掉，于是插件表面一切正常、设置页却没了。
+  0.9.2 起两代契约都支持：0.1.5/0.1.6 走 `installSection`，0.1.7+ 走
+  `configure({ auto: false })` + schema 上的 `volatile` 标记（那一代的设置页只渲染
+  volatile 字段）。同时把供应商注册的 `settingsNs` 改成 **loader entry id**
+  （`cmdgo-provider`，与 0.1.7 的 `describe()` 同键），并监听
+  `loader/volatile-update` 让「设置页改了配置要生效」成立。
+  ⚠️ `volatile` 需要 `@deepseek-ai/schemastery` **3.18.3+**（3.18.2 及更早既没有
+  类型也没有运行时）。若宿主上解析到旧版，日志里会出现
+  `[cmdgo] Config 没有任何 volatile 字段，设置页不会显示该区块`——照着升 schemastery
+  即可，不用怀疑别处。
+
 - **装完不显示**：`dsh plugin add` 只写 profile 清单，运行中的 loader 需要重启（或热装配工具）才会加载；另外检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否残留同 id 的 `disabled: true` 条目——卸载器会写它阻断自装配，重装前应删除。
 - **模型列表为空（显示 0）**：目录来自 `https://api.commandcode.ai/provider/v1/models`（免鉴权）。
   冷启动时网络可能尚未就绪，因此首扫失败会按 **3s → 10s → 30s → 60s** 快速退避重试，

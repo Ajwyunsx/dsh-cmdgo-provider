@@ -35,7 +35,7 @@ import type {
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { createHash, randomUUID } from 'node:crypto'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
-import { buildRequest, CC_VERSION, DEFAULT_MAX_TOKENS, eventToChunks, gatewayErrorMessage, parseEventStream, streamErrorCode, streamErrorText, usageSummary } from './protocol.js'
+import { buildRequest, CC_VERSION, DEFAULT_MAX_TOKENS, eventToChunks, gatewayErrorMessage, gatewayEventHasVisibleOutput, parseEventStream, streamErrorCode, streamErrorText, usageSummary } from './protocol.js'
 import type { CcStreamState, CcUsageSummary, ImageResolver, RequestRepair } from './protocol.js'
 import type { ModelInputModality } from './models.js'
 
@@ -490,6 +490,11 @@ export class CommandCodeGoAdapter extends LlmAdapter {
     const state: CcStreamState = { blockIndex: 0 }
     let eventCount = 0
     let sawError = false
+    // 整轮是否产出过可用内容（正文或工具调用）：终态到达时用它挡住「空回合」
+    // ——HTTP 200、流正常以 finish 结束，但没有任何可见输出。宿主会当成功收下，
+    // `dsh-llm-retry` 也就没有介入的机会（它只对失败码重试）；用户看到的是
+    // 「模型什么都没说，这一轮就结束了」（issue #9）。
+    let hasVisibleOutput = false
     for await (const event of parseEventStream(response.body)) {
       eventCount += 1
       // 网关的 error / abort 是流的真实终止原因。此前它们被忽略，于是流一结束就
@@ -512,12 +517,22 @@ export class CommandCodeGoAdapter extends LlmAdapter {
       if (event.type === 'text-start' || event.type === 'reasoning-start' || event.type === 'tool-call') {
         state.blockIndex += 1
       }
+      if (gatewayEventHasVisibleOutput(event)) hasVisibleOutput = true
       // 用量在事件转 chunk 之前先取一份给宿主（缓存读写要能显示出来，issue #6）。
       if (event.type === 'finish-step' || event.type === 'finish') {
         const usage = usageSummary(event)
         if (usage !== undefined) this.fireUsage(usage, options)
       }
-      yield* eventToChunks(event, state)
+      const chunks = eventToChunks(event, state)
+      // `state.finished` 只有 eventToChunks 才会置位，所以判定必须排在它后面；
+      // 判定失败时这几个 chunk（usage/finish）一并丢掉——这一轮本来就不算成功。
+      if (state.finished === true && !hasVisibleOutput) {
+        throw new LlmError(
+          `Command Code completed without visible output (${eventCount} event(s), model=${options.model})`,
+          'EMPTY_RESPONSE',
+        )
+      }
+      yield* chunks
       // finish-step 或 finish 任一到达都表示本轮已正常结束。
       if (state.finished === true) return
     }

@@ -124,8 +124,7 @@ interface ConnectionGate {
   requestRejection(request: { headers: Record<string, string | string[] | undefined> }): number | undefined
 }
 
-/** 本机回环主机名（含 IPv6 的带括号写法）。 */
-function isLoopbackHostname(hostname: string): boolean {
+/** 本机回环主机名（含 IPv6 的带括号写法）。 */function isLoopbackHostname(hostname: string): boolean {
   return hostname === 'localhost'
     || hostname === '::1'
     || hostname === '[::1]'
@@ -182,13 +181,120 @@ export interface Config {
   retryPolicy?: RetryPolicyConfig
 }
 
+/**
+ * settings 服务的两代形状。0.1.7 删掉了 `installSection`，改用
+ * `configure(presentation, owner)`（页面策略，表单由 loader 的 volatile 投影生成）。
+ * 两个方法都按可选声明，运行时按存在性分派，同一份代码在新旧宿主上都能装配。
+ */
+interface SettingsSectionHooks {
+  setSource: (source: () => Config) => void
+  onChange: () => void
+}
+
+interface SettingsServiceLike {
+  installSection?: (
+    owner: unknown,
+    ns: string,
+    schema: z<Config>,
+    entry: Config,
+    hooks: SettingsSectionHooks,
+  ) => void
+  configure?: (presentation: { auto?: boolean }, owner?: unknown) => () => void
+}
+
+/**
+ * 本插件在 settings 里的命名空间。
+ *
+ * dsh 0.1.7+ 由 loader 投影：`describe()` 用 `ns: entry.options.id`（profile 里
+ * 就是 `cmdgo-provider`）。Models 页回查该供应商的配置时用的正是同一个键，所以
+ * `registerConfigurableProviders` 必须报这个值；自报的 `NS` 只作为老宿主的回落。
+ */
+function settingsNamespace(ctx: Context): string {
+  const entry = (ctx.fiber as { entry?: { options?: { id?: unknown } } } | undefined)?.entry
+  const id = entry?.options?.id
+  return typeof id === 'string' && id.length > 0 ? id : NS
+}
+
+/**
+ * schema（含嵌套）是否声明了至少一个 volatile 字段。
+ *
+ * 子 schema 挂在**节点本体**的 `dict` / `inner` / `list` 上，不在 `meta` 里；
+ * 第一版写成 `meta.dict` 会永远返回 false（等于恒定误报「设置页不会显示」）。
+ */
+function hasVolatileField(schema: unknown): boolean {
+  const node = schema as {
+    meta?: { volatile?: boolean }
+    dict?: Record<string, unknown>
+    inner?: unknown
+    list?: readonly unknown[]
+  } | undefined
+  if (node === undefined || node === null) return false
+  if (node.meta?.volatile === true) return true
+  return Object.values(node.dict ?? {}).some(child => hasVolatileField(child))
+    || hasVolatileField(node.inner)
+    || (node.list ?? []).some(child => hasVolatileField(child))
+}
+
+// `.volatile()` 只存在于 `@deepseek-ai/schemastery` 3.18.3+（3.18.2 及更早既没有
+// 类型也没有运行时——裸 `schemastery` 更是永远没有）。这里按能力探测而不是按声明
+// 的 peer 最低版：声明 `^3.18.1` 只保证**装得上**，装到 3.18.1/3.18.2 时标记会
+// 静默缺失，等于设置页整块消失，所以 0.1.7+ 上必须显式报出来（见 apply()）。
+/** 标明该字段可被 dsh 0.1.7+ 的设置页渲染为可编辑表单（0.1.5 忽略该 meta）。 */
+function volatile<T extends object>(schema: T): T {
+  // 字段级 API 在实例上（`Schema.prototype.volatile`），不在工厂函数 `z` 上。
+  const mark = (schema as { volatile?: () => T }).volatile
+  return typeof mark === 'function' ? mark.call(schema) : schema
+}
+
 export const Config: z<Config> = z.object({
-  apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV),
-  baseURL: z.string().default(DEFAULT_BASE_URL),
-  maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
-  defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
-  retryPolicy: RetryPolicySchema,
-})
+  // 每个字段都必须 volatile：dsh 0.1.7 起设置页只渲染 volatile 字段
+  // （`dsh-settings` 的 `volatileForm()`），漏标 = 该字段在设置页上不存在；
+  // 这也是 0.1.5 的 `installSection` 路径与 0.1.7 的 loader 投影路径唯一能共用
+  // 的写法（0.1.5 忽略该 meta）。
+  apiKeyEnv: volatile(z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV)),
+  baseURL: volatile(z.string().default(DEFAULT_BASE_URL)),
+  maxTokens: volatile(z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS)),
+  defaultContextWindow: volatile(z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW)),
+  retryPolicy: volatile(RetryPolicySchema),
+}) as unknown as z<Config>
+
+/**
+ * volatile 配置引用的写入标记（`@deepseek-ai/cosmokit` 的
+ * `Symbol.for('cosmokit.volatile.write')`）。
+ *
+ * 刻意**不** import cosmokit：`isVolatile` 只是「这个符号在不在」的包装，而
+ * `Symbol.for` 是跨 realm / 跨 ESM-CJS 副本共享的注册表键，所以这里直接用同一个
+ * 键判定即可。好处是插件在那个包缺席（老宿主、精简安装）时依然能装配——直接
+ * import 一个可选的 peer 会让整个插件在它缺失时链接失败。
+ */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+/**
+ * 读取边界统一解引用：volatile 字段解析出来是 `{ get() }` 持有器，消费方
+ * （adapter 连接事实、凭据 ref）要的是裸值。旧宿主给裸值，原样透传。
+ *
+ * 未知键原样保留：`Object.entries` 是 `string`，直接 `as Config` 会把「其实
+ * 多带了键」这件事藏起来（`plainConfig` 在 loader/volatile-update 路径上还会
+ * 吃到宿主给的整块对象）。
+ */
+function plainConfig(config: Config): Config {
+  if (typeof config !== 'object' || config === null) return config
+  // 持有器：解引用一次（`get()` 返回的是不可变快照，直接消费即可）。
+  const write = (config as { [VOLATILE_WRITE]?: unknown })[VOLATILE_WRITE]
+  if (write !== undefined && typeof (config as { get?: () => unknown }).get === 'function') {
+    return plainConfig((config as unknown as { get: () => Config }).get())
+  }
+  // 数组整体保留形状：逐个键递归会把数组变成 `{"0":…}`，下游的
+  // `retryableCodes.some(...)` 之类会直接炸掉。
+  if (Array.isArray(config)) {
+    return config.map(entry => plainConfig(entry as Config)) as unknown as Config
+  }
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(config)) {
+    out[key] = plainConfig((config as Record<string, unknown>)[key] as Config)
+  }
+  return out as Config
+}
 
 /** 从原始配置到已校验连接事实的唯一归一化步骤。 */
 export function resolveAdapterOptions(config: Config, scanned: readonly CommandCodeGoModel[]): CommandCodeGoConnectionOptions {
@@ -213,7 +319,10 @@ export function apply(ctx: Context, config: Config): void {
   // 实时扫描的目录放在 settings 快照之外：扫描结果不能被设置写入覆盖；
   // adapter 通过 thunk 读合并视图。
   let scanned: CommandCodeGoModel[] = []
-  let current: () => Config = () => config
+  // 首个快照就要解引用：0.1.7+ 丢给插件的 config 里 volatile 字段是 `{ get() }`
+  // 持有器（见 plainConfig）。apply 因此保持同步——cordis 不 await 插件回调，
+  // 这里一旦改成 async，它后面的注册代码就会和 fiber 的装载赛跑。
+  let current: () => Config = () => plainConfig(config)
   let cache: { raw: Config; scanned: readonly CommandCodeGoModel[]; options: CommandCodeGoConnectionOptions } | undefined
   const options = (): CommandCodeGoConnectionOptions => {
     const raw = current()
@@ -669,7 +778,11 @@ export function apply(ctx: Context, config: Config): void {
     },
   })
   ctx.llm.registerConfigurableProviders([
-    { provider: PROVIDER, displayName: 'Command Code Go', settingsNs: NS, settingsPath: [] },
+    // 命名空间必须跟 dsh 0.1.7+ 的 settings 投影一致：那一代 `describe()` 用
+    // `ns: entry.options.id`（profile 里的 `cmdgo-provider`），而不是插件自报的
+    // `cmdgo`——两者不一致时 Models 页按 settingsNs 回查配置会找不到（issue #8
+    // 的第三节）。老宿主上 entry 不存在，回落到自报 NS。
+    { provider: PROVIDER, displayName: 'Command Code Go', settingsNs: settingsNamespace(ctx), settingsPath: [] },
   ])
   const registration = ctx.llm.registerAdapter([PROVIDER], adapter)
   let registeredPolicy = options().retryPolicy
@@ -680,14 +793,57 @@ export function apply(ctx: Context, config: Config): void {
     registeredPolicy = policy
   }
 
-  // dsh 0.1.5 起 settings 区块改为服务方法 `ctx.settings.installSection`，
-  // 必须在注入 settings 服务的回调里注册（旧版是顶层函数 installSettingsSection）。
+  // dsh 0.1.7+ 的 loader 会在 volatile 配置被提交后向拥有者 fiber 派发
+  // `loader/volatile-update`。settings 的 volatile 快照是**原地更新**的稳定引用
+  // （config 对象身份不变），所以插件里按身份做键的 `options()` 缓存永远不会自己
+  // 失效——不监听就会出现「设置页改了值但不生效」。`ensureRegistrationFacts` 顺带
+  // 承担重读（retryPolicy 变了要重新注册路由）。旧宿主不发这个事件，监听是空转。
+  // 事件名按字符串走 cordis 的运行期事件总线：0.1.7 的 Events 表里有它，旧宿主的
+  // 类型里没有，写死字符串 + 断言即可，不必为这个可选事件抬高类型下限。
+  ;(ctx as unknown as { on: (event: string, listener: () => void) => void })
+    .on('loader/volatile-update', () => {
+      ensureRegistrationFacts()
+    })
+
+  // settings 区块注册：两代 API 都要支持，而且都必须在注入回调里注册
+  // （旧版是顶层函数 installSettingsSection）。
+  //
+  // - dsh 0.1.5 / 0.1.6：`settings.installSection(owner, ns, schema, entry, hooks)`
+  //   —— 由插件主动装一个区块，ns 由插件自报。
+  // - dsh 0.1.7+：`installSection` 已被删除。settings 翻转为「投影 loader 配置」：
+  //   带 `.volatile()` 的字段由 `volatileForm()` 渲染成可编辑表单，命名空间键是
+  //   **entry id**（`entry.options.id`，即 profile 里的 `cmdgo-provider`），而不是
+  //   插件自报的 NS。因此这里改用 `configure({ auto: false }, ctx.fiber)`，并让
+  //   `registerConfigurableProviders` 的 settingsNs 跟随 entry id。
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource: (source) => {
-        current = source
-      },
-      onChange: ensureRegistrationFacts,
+    // cordis 注入的服务既在 `get()` 表里也挂成访问器；两条都试，任一条可用即可。
+    // 两条都拿不到时不注册（而不是抛错）：一次注入竞态不该炸掉整个插件装配。
+    const settings = (settingsCtx.get('settings') ?? settingsCtx.settings) as SettingsServiceLike | undefined
+    if (settings === undefined) {
+      ctx.logger.warn('[cmdgo] settings 服务不可用，设置页区块本次未注册')
+      return
+    }
+    settingsCtx.effect(() => {
+      if (typeof settings.installSection === 'function') {
+        // 老路：0.1.5/0.1.6 的主动安装。ns 用自报值（那代 describe() 也用这个键）。
+        settings.installSection(ctx, NS, Config, config, {
+          setSource: (source) => {
+            current = () => plainConfig(source())
+          },
+          onChange: ensureRegistrationFacts,
+        })
+        return () => {}
+      }
+      if (typeof settings.configure !== 'function') return () => {}
+      // 新路：只声明页面策略，表单由 loader 投影产生（见上）。
+      const dispose = settings.configure({ auto: false }, ctx.fiber)
+      // 配置目录里没有 volatile 字段时设置页会整块消失——0.1.7 起最常见的
+      // 故障形态就是「插件看着正常、设置页没了且 stderr 无输出」。显式报错，
+      // 别让它再静默。
+      if (!hasVolatileField(Config)) {
+        ctx.logger.error('[cmdgo] Config 没有任何 volatile 字段，设置页不会显示该区块（dsh 0.1.7+ 的投影契约）')
+      }
+      return dispose
     })
   })
 
