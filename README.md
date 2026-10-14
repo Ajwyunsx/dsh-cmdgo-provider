@@ -145,6 +145,12 @@ const generateSessionId = () => `sess_${randomUUID().replace(/-/g, '').substring
 
 ## 工具调用双射与请求自愈（0.9.0+）
 
+请求历史兼容两种工具结果格式：当前 DSH 的独立 `role: 'tool'` 消息，以及旧版嵌在
+用户内容中的 `tool-result` 块。配对前先统一格式，保留调用 ID、错误状态和图片内容。
+否则独立结果会被误当作普通用户文字，对应的历史工具调用又被孤儿过滤删除，导致
+模型看到的工具历史失真，可能只输出“准备调用工具”的说明就结束。此修复与 0.9.2
+的空回合守卫互补：已经输出正文的提前结束不会触发空回合守卫。
+
 网关对请求形状有一条**硬校验**：assistant 消息里的每个 `tool-call` 必须**恰好**有
 一条同 id 的 `tool-result`；不满足就整轮
 `{"type":"error","error":{"type":"server_error","message":"Tool result is missing for tool call …"}}`
