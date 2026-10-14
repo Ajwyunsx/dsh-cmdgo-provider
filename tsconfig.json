@@ -10,7 +10,6 @@
     "declaration": false,
     "outDir": "lib",
     "rootDir": "src",
-    "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
       "@deepseek-ai/*": ["node_modules/@deepseek-ai/*"]
