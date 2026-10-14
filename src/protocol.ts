@@ -440,13 +440,16 @@ export async function buildRequest(
   // （见 ToolPairing 与 issue #5）。
   // DSH also supplies standalone tool messages. Normalize before pairing:
   // otherwise valid calls are dropped and their results become user text.
-  const history: Message[] = options.messages.map(message => message.role === 'tool'
+  // dsh-llm <= 0.1.x did not declare the standalone ToolResultMessage even
+  // though dsh-llm 0.2.x hosts can provide it at runtime.
+  const raw = options.messages as ReadonlyArray<Message & { toolCallId?: string; isError?: boolean }>
+  const history: Message[] = raw.map(message => message.role === 'tool'
     ? {
         ...message,
         role: 'user',
         content: [{
           type: 'tool-result',
-          toolCallId: message.toolCallId,
+          toolCallId: message.toolCallId as string,
           content: message.content,
           isError: message.isError,
         }],
