@@ -18,13 +18,27 @@
  */
 
 import type {
-  ContentBlock,
+  ContentBlock as HostContentBlock,
   FinishReason,
   GenerateOptions,
-  Message,
   StreamChunk,
   ToolSchema,
 } from '@deepseek-ai/dsh-llm'
+
+/** Wire projection accepts legacy nested results as well as current DSH blocks. */
+export type CompatibleContentBlock = Exclude<HostContentBlock, { type: 'tool-result' }> | {
+  type: 'tool-result'
+  toolCallId: string
+  content: readonly CompatibleContentBlock[]
+  isError?: boolean
+}
+type ContentBlock = CompatibleContentBlock
+/** Only message fields needed by history pairing and serialization. */
+export interface CompatibleMessage {
+  role: string
+  content: readonly CompatibleContentBlock[]
+}
+type Message = CompatibleMessage
 import { platform, arch } from 'node:os'
 
 /**
@@ -170,7 +184,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** The flattened text of a message's content blocks. */
-function flattenText(blocks: ContentBlock[]): string {
+function flattenText(blocks: readonly ContentBlock[]): string {
   return blocks
     .filter(block => block.type === 'text')
     .map(block => block.text)
@@ -300,7 +314,7 @@ function safeParseJson(raw: string): unknown {
  * results that survive serialization (`kept`), so an image never rides into the
  * request without the result that carried it.
  */
-function collectImages(blocks: ContentBlock[], kept?: ReadonlySet<ContentBlock>): ImageBlock[] {
+function collectImages(blocks: readonly ContentBlock[], kept?: ReadonlySet<ContentBlock>): ImageBlock[] {
   const found: ImageBlock[] = []
   for (const block of blocks) {
     if (block.type === 'image') found.push(block)
@@ -424,8 +438,25 @@ export async function buildRequest(
   const messages: CcMessage[] = []
   // 先建立工具调用/结果的双射视图：孤儿调用、孤儿结果、重复 id 都在这里被丢掉
   // （见 ToolPairing 与 issue #5）。
-  const pairing = pairingFor(options.messages, repair?.dropToolCallIds)
-  for (const message of options.messages) {
+  // DSH also supplies standalone tool messages. Normalize before pairing:
+  // otherwise valid calls are dropped and their results become user text.
+  // dsh-llm <= 0.1.x did not declare the standalone ToolResultMessage even
+  // though dsh-llm 0.2.x hosts can provide it at runtime.
+  const raw = options.messages as ReadonlyArray<Message & { toolCallId?: string; isError?: boolean }>
+  const history: Message[] = raw.map(message => message.role === 'tool'
+    ? {
+        ...message,
+        role: 'user',
+        content: [{
+          type: 'tool-result',
+          toolCallId: message.toolCallId as string,
+          content: message.content,
+          isError: message.isError,
+        }],
+      }
+    : message)
+  const pairing = pairingFor(history, repair?.dropToolCallIds)
+  for (const message of history) {
     if (message.role === 'system') {
       system += (system ? '\n\n' : '') + flattenText(message.content)
       continue

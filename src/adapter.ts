@@ -22,13 +22,11 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import type {
-  ContentBlock,
   GenerateOptions,
   LlmModelInfo,
   LlmModelReasoningInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
-  Message,
   ResolvedRetryPolicy,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
@@ -36,7 +34,7 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { createHash, randomUUID } from 'node:crypto'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import { buildRequest, CC_VERSION, DEFAULT_MAX_TOKENS, eventToChunks, gatewayErrorMessage, gatewayEventHasVisibleOutput, parseEventStream, streamErrorCode, streamErrorText, usageSummary } from './protocol.js'
-import type { CcStreamState, CcUsageSummary, ImageResolver, RequestRepair } from './protocol.js'
+import type { CcStreamState, CcUsageSummary, ImageResolver, RequestRepair, CompatibleContentBlock as ContentBlock, CompatibleMessage as Message } from './protocol.js'
 import type { ModelInputModality } from './models.js'
 
 /** One catalog model advertised by the adapter. */

@@ -59,6 +59,43 @@ function pairingOf(body) {
 
 const rounds = (list) => list.join(',')
 
+/* Current DSH uses standalone tool messages rather than nested result blocks. */
+console.log('[A0] 独立工具消息兼容')
+const standalone = (id, text = 'ok', isError = false) => ({
+  role: 'tool', toolCallId: id, isError, content: [{ type: 'text', text }],
+})
+const nativeHistory = [
+  { role: 'assistant', content: [{ type: 'text', text: '读取下一行。' }, call('native')] },
+  standalone('native', 'line 19'),
+]
+const snapshot = JSON.stringify(nativeHistory)
+const native = await request(nativeHistory)
+const legacy = await request([nativeHistory[0], { role: 'user', content: [result('native', 'line 19')] }])
+check('独立结果和旧嵌套结果序列化一致', JSON.stringify(native.params) === JSON.stringify(legacy.params))
+check('说明之后的历史调用保留', native.params.messages[0].content.some(part => part.type === 'tool-call'))
+check('结果保持 tool 身份而非普通 user 文本', native.params.messages[1].role === 'tool' && native.params.messages[1].content[0].output.value === 'line 19')
+check('不修改调用方历史', JSON.stringify(nativeHistory) === snapshot)
+const failedNative = await request([nativeHistory[0], standalone('native', 'denied', true)])
+check('独立工具错误保留 error-text', failedNative.params.messages[1].content[0].output.type === 'error-text')
+const duplicatesNative = await request([...nativeHistory, { role: 'user', content: [result('native')] }])
+check('两种格式混合时结果只发一次', pairingOf(duplicatesNative).results.length === 1)
+const removedNative = await request(nativeHistory, undefined, { dropToolCallIds: new Set(['native']) })
+check('修复过滤仍删除独立消息两侧', pairingOf(removedNative).calls.length === 0 && pairingOf(removedNative).results.length === 0)
+let imageResolutions = 0
+const nativeImage = { role: 'tool', toolCallId: 'native', content: [image('native-image')] }
+const resolveNativeImage = async () => { imageResolutions++; return 'data:image/png;base64,AAAA' }
+const imageBody = await request([nativeHistory[0], nativeImage], resolveNativeImage)
+check('独立结果里的图片仍发送', imageResolutions === 1 && JSON.stringify(imageBody.params.messages).includes('data:image/png;base64,AAAA'))
+imageResolutions = 0
+const orphanNative = await request([nativeImage], resolveNativeImage)
+check('孤儿独立结果及其图片不泄漏', pairingOf(orphanNative).results.length === 0 && imageResolutions === 0)
+
+const multiNative = await request([
+  { role: 'assistant', content: [call('first')] }, standalone('first', 'first result'),
+  { role: 'assistant', content: [{ type: 'text', text: '继续读取。' }, call('second')] }, standalone('second', 'second result'),
+])
+check('连续步骤的历史调用和结果完整配对', rounds(pairingOf(multiNative).calls) === 'first,second' && rounds(pairingOf(multiNative).results) === 'first,second')
+
 /* ---------- [A] 工具调用双射 ---------- */
 console.log('[A] 工具调用双射（issue #5）')
 
