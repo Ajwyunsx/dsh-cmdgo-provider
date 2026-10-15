@@ -14,10 +14,7 @@ Command Code 的订阅分两种：
 ## 安装
 
 ```sh
-# npm（推荐）
-dsh plugin add dsh-cmdgo-provider
-
-# 或从 GitHub 安装
+# 从 GitHub 安装 （推荐）
 dsh plugin add github:Ajwyunsx/dsh-cmdgo-provider
 ```
 
