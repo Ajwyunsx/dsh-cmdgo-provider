@@ -107,12 +107,64 @@ interface ImageAttachmentRefLike {
   height: number
 }
 
+/**
+ * `readImageRequest` 的第二参数按宿主版本有**两种形状**（issue #12）：
+ *
+ * - dsh 0.1.x：`ImageRequestPolicy`（`{ maxPixels, maxBytes }`）——宿主自己拿
+ *   ref 的宽高算投影尺寸；
+ * - dsh 0.2.x：`ImageRequestTarget`（`{ width, height, maxBytes }`）——路由方
+ *   （也就是本插件）必须先算好目标尺寸再要图，缺 `width`/`height` 会被
+ *   `validateTarget()` 直接抛错。
+ *
+ * 两种形状的字段都是必填的正整数，这里按并集声明，运行时按「先试新形状、
+ * 失败回退旧形状」处理（见 `readRequestImage`）。
+ */
+interface ImageRequestShape {
+  maxPixels?: number
+  maxBytes?: number
+  width?: number
+  height?: number
+}
+
 interface ImageAttachmentService {
   readImageRequest(
     ref: ImageAttachmentRefLike,
-    policy: { maxPixels: number; maxBytes: number },
+    shape: ImageRequestShape,
     signal: AbortSignal | undefined,
   ): Promise<{ data: Uint8Array; mediaType: string }>
+}
+
+/**
+ * 宿主 0.1.x `requestImageDimensions()` 的内联副本（`@deepseek-ai/dsh-attachment`
+ * 的 request-projection 纯函数）：保纵横比的整数投影，收敛到 `maxPixels` 以内、
+ * 不放大。与宿主逐位一致很重要——0.2.x 把 target 的宽高与字节预算一起哈希进
+ * 缓存变体身份（`requestImageVariantId`），尺寸算得不同只会多生成一份缓存变体；
+ * 而超出像素预算可能被宿主的 `assertImagesFit` 判成需要 offload。所以这里复刻
+ * 算法而不是「差不多就行」。
+ */
+function requestImageDimensions(
+  width: number,
+  height: number,
+  maxPixels: number,
+): { width: number; height: number } {
+  const scale = Math.min(1, Math.sqrt(maxPixels / (width * height)))
+  if (scale === 1) return { width, height }
+  if (width >= height) {
+    let projectedWidth = Math.max(1, Math.floor(width * scale))
+    let projectedHeight = Math.max(1, Math.round((projectedWidth * height) / width))
+    while (projectedWidth * projectedHeight > maxPixels && projectedWidth > 1) {
+      projectedWidth -= 1
+      projectedHeight = Math.max(1, Math.round((projectedWidth * height) / width))
+    }
+    return { width: projectedWidth, height: projectedHeight }
+  }
+  let projectedHeight = Math.max(1, Math.floor(height * scale))
+  let projectedWidth = Math.max(1, Math.round((projectedHeight * width) / height))
+  while (projectedWidth * projectedHeight > maxPixels && projectedHeight > 1) {
+    projectedHeight -= 1
+    projectedWidth = Math.max(1, Math.round((projectedHeight * width) / height))
+  }
+  return { width: projectedWidth, height: projectedHeight }
 }
 
 /**
@@ -732,17 +784,71 @@ export function apply(ctx: Context, config: Config): void {
   // --- 图像输入：把 harness 的附件引用解析成网关要的 data URL ---
   // 附件服务是可选的：没有它时适配器会把图片降级成占位文字，绝不静默丢图。
   const requestImageEncoding = { maxPixels: DEFAULT_REQUEST_IMAGE_PIXELS, maxBytes: DEFAULT_REQUEST_IMAGE_BYTES }
+  // 图片读取失败每个 attachmentId 只告警一次：同一张图会在重试/续写里反复出现，
+  // 刷屏没有意义；但一条都不发，用户就只能靠模型念占位文字来发现视觉挂了（#12）。
+  const imageWarned = new Set<string>()
+
+  /**
+   * 按宿主版本选 `readImageRequest` 的第二参数（issue #12）：
+   *
+   * - 0.2.x 要 `ImageRequestTarget`（`{ width, height, maxBytes }`）：用宿主同一套
+   *   `requestImageDimensions()` 几何从 ref 投影出目标尺寸，`validateTarget()` 才放行；
+   * - 0.1.x 要 `ImageRequestPolicy`（`{ maxPixels, maxBytes }`）：宿主自己投影。
+   *
+   * 运行时无法可靠探测宿主版本（0.2.x 的类型在旧 peer 里不存在），所以先发新
+   * 形状、`validateTarget` 拒了再回退旧形状——两侧各只走一次，结果按 ref 缓存，
+   * 不会在每次请求里反复试错。
+   */
+  const shapeCache = new Map<string, ImageRequestShape>()
+  const readRequestImage = async (
+    attachments: ImageAttachmentService,
+    ref: ImageAttachmentRefLike,
+  ): Promise<{ data: Uint8Array; mediaType: string }> => {
+    const cached = shapeCache.get(ref.attachmentId)
+    if (cached !== undefined) return attachments.readImageRequest(ref, cached, undefined)
+    const target: ImageRequestShape = {
+      ...requestImageDimensions(ref.width, ref.height, requestImageEncoding.maxPixels),
+      maxBytes: requestImageEncoding.maxBytes,
+    }
+    try {
+      const projected = await attachments.readImageRequest(ref, target, undefined)
+      shapeCache.set(ref.attachmentId, target)
+      return projected
+    } catch (error) {
+      // 回退旧形状前先看新形状是不是真的被拒了：其它错误（附件缺失、解码失败）
+      // 在旧宿主上同样会失败，不该再试一次。判据用 0.2.x validateTarget 的
+      // 实际报错文本（"Image request width must be a positive integer."）。
+      const message = error instanceof Error ? error.message : String(error)
+      if (!/Image request (width|height|maxBytes)/.test(message)) throw error
+      const legacy: ImageRequestShape = { ...requestImageEncoding }
+      const projected = await attachments.readImageRequest(ref, legacy, undefined)
+      shapeCache.set(ref.attachmentId, legacy)
+      return projected
+    }
+  }
 
   /** 读取一份附件的请求版本并编码成 `data:<mediaType>;base64,<bytes>`。 */
   const resolveImage: ImageResolver = async (block) => {
     const attachments = ctx.get('attachments') as ImageAttachmentService | undefined
     if (attachments === undefined) return undefined
-    const projected = await attachments.readImageRequest(
-      block.attachment,
-      requestImageEncoding,
-      undefined,
-    )
-    return `data:${projected.mediaType};base64,${Buffer.from(projected.data).toString('base64')}`
+    try {
+      const projected = await readRequestImage(attachments, block.attachment)
+      return `data:${projected.mediaType};base64,${Buffer.from(projected.data).toString('base64')}`
+    } catch (error) {
+      // 占位文字仍由协议层给出（半截成功不能被翻成整轮失败），但原因必须留下：
+      // 这次 issue 就是靠模型念出占位文字才定位到根因的。
+      const message = error instanceof Error ? error.message : String(error)
+      const id = String(block.attachment.attachmentId)
+      if (!imageWarned.has(id)) {
+        imageWarned.add(id)
+        ctx.logger.warn(
+          '[cmdgo] 附件 %s 的请求图像读取失败，本轮以占位文字替代：%s',
+          id.slice(0, 23),
+          message,
+        )
+      }
+      throw error
+    }
   }
 
   const adapter = new CommandCodeGoAdapter({

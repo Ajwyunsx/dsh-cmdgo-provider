@@ -338,7 +338,10 @@ async function imageParts(blocks: ImageBlock[], resolveImage?: ImageResolver): P
     if (resolveImage !== undefined) {
       try {
         dataUrl = await resolveImage(block)
-      } catch (_imageResolutionFailure) {
+      } catch (error) {
+        // 解析失败 → 该图以占位文字发送（半截成功不能翻成整轮失败）。
+        // 真实原因由 resolver 侧负责落日志（它才有 ctx.logger；#12 的教训：
+        // 这里把 throw 整个吞掉，视觉全灭时用户只能靠模型念占位文字定位）。
         dataUrl = undefined
       }
     }

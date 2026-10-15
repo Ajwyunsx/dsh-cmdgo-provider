@@ -192,8 +192,18 @@ harness 见到「声明了模态且不含 image」就会把图片换成占位文
 
 **传输**：图片按官方 CLI 的网关形态发送——`{type:'image', image:'data:<mime>;base64,…'}`
 （不是 Anthropic 的 `source` 包装；网关会把它归一化成 `{type:'file', mediaType, data}`）。
-harness 的图像块是附件引用，因此经 `attachments.readImageRequest(ref, {maxPixels: 640000, maxBytes: 1 MiB})`
-取请求版本再编码；附件服务缺席或读取失败时降级为显式占位文字，**绝不静默丢图**。
+harness 的图像块是附件引用，经 `attachments.readImageRequest(ref, shape)` 取请求版本再编码。
+`shape` 按宿主版本分派（0.9.4+，issue #12）：
+
+- **dsh 0.2.x** 要 `ImageRequestTarget`（`{width, height, maxBytes}`）：插件用与宿主
+  逐位一致的 `requestImageDimensions()` 几何把附件引用投影成目标尺寸再要图——
+  0.9.3 及之前传旧 policy 形状会被 `validateTarget()` 拒掉，所有图片静默降级成
+  `[image omitted: … could not be read]`；
+- **dsh 0.1.x** 要 `ImageRequestPolicy`（`{maxPixels, maxBytes}`）：新形状被 validate
+  拒时自动回退旧形状（按 attachmentId 记忆，不反复试错）。
+
+附件服务缺席或读取失败时降级为显式占位文字，**绝不静默丢图**；读取失败另留一条
+warn 日志（每个附件一次，带原始错误信息），不再只能靠模型念占位文字定位。
 工具结果里内嵌的图片按 harness 自己的递归口径取出，跟在 tool 消息后以单独一条 user 消息发送。
 
 **实测**：`moonshotai/Kimi-K2.5`、`Qwen/Qwen3.8-Flash` 对 6 种纯色图 6/6 正确识别。
@@ -381,6 +391,19 @@ DSH 运行期间打开一个恶意页面，它就能静默调用：
   类型也没有运行时）。若宿主上解析到旧版，日志里会出现
   `[cmdgo] Config 没有任何 volatile 字段，设置页不会显示该区块`——照着升 schemastery
   即可，不用怀疑别处。
+
+- **0.2.x 上所有图片都变成 `[image omitted: … could not be read]`**（#12）：
+  dsh 0.2.x 的 `readImageRequest` 第二参数从 0.1.x 的 policy（`{maxPixels, maxBytes}`）
+  换成了 `ImageRequestTarget`（`{width, height, maxBytes}`），`validateTarget()` 对缺
+  `width`/`height` 直接抛错——旧形状在 0.2.x 上 100% 失败，而抛错被协议层吞掉，
+  表现是视觉全灭且无日志（模型只能念出占位文字）。0.9.4 起用与宿主同一套
+  `requestImageDimensions()` 几何把 ref 投影成 target 再要图；0.1.x 宿主按
+  「新形状被 validate 拒 → 回退旧 policy」处理（按 attachmentId 记忆，不反复试错）。
+  读取失败现在会留一条 warn 日志（每个附件一次，带原始错误信息）——占位文字仍会
+  发出（半截成功不能翻成整轮失败），但原因不再只能靠模型念出来。
+  **区分**：harness 自己在纯文本路由上的替换文案是
+  `[image omitted because this model accepts text only; …]`（模态声明问题）；本插件的
+  占位是 `[image omitted: attachment … could not be read]`（读取失败，看 warn 日志）。
 
 - **装完不显示**：`dsh plugin add` 只写 profile 清单，运行中的 loader 需要重启（或热装配工具）才会加载；另外检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否残留同 id 的 `disabled: true` 条目——卸载器会写它阻断自装配，重装前应删除。
 - **模型列表为空（显示 0）**：目录来自 `https://api.commandcode.ai/provider/v1/models`（免鉴权）。
