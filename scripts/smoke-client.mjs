@@ -364,25 +364,23 @@ check('厂家芯片横向滚动条与模型列表同色（两处并排不能有�
      v2 浅灰底（#f1f1f4）   → 对白底只有 1.13 对比度，用户看不出哪个被选中
      v3 深灰填充（#3f3f46） → 实心感够、又比纯黑柔一层（与白字对比 10.44 vs 19.78）
    所以既不能退回浅灰（丢可辨识性），也不能退回纯黑（丢层级）。 */
-/* 选中芯片：必须是实心填充，且填充灰度要过 WCAG AA。
-   这一格来回改过四次，每次都是一个真实的失败方向，所以断言守的是**双向边界**：
-     v1 #0a0a0c 纯黑   白字 19.78 → 太硬（"全黑不太好看"）
-     v2 #f1f1f4 浅灰   底vs白底 1.13 → 看不出选中（"看不出被选中"）
-     v3 #3f3f46 深灰   白字 10.44 → 看得清但偏重（"尤其的灰"）
-     v4 #6e6e79 中灰   白字 5.04 → 更浅且仍过 AA ← 当前
-   所以：
-     - 底不能是浅色档（防退回 v2 那种看不出来的状态）
-     - 底不能是纯黑（防退回 v1）
-     - 若配白字，底必须够深（白字对比 ≥4.5，防退到 #7a7a85 那种读不清的档） */
+/* 选中芯片：靠**形状信号**辨识，不靠灰度深浅。
+   这里定格的是一次完整的排查结论 —— 填充方案试了四版全都不行：
+     v1 #0a0a0c 纯黑   白字 19.78 → "全黑不太好看"
+     v2 #f1f1f4 浅灰   底vs白 1.13 → "看不出被选中"
+     v3 #3f3f46 深灰   白字 10.44 → "尤其的灰"
+     v4 #6e6e79 中灰   白字  5.04 → "在白色背景配合下看起来更黑"
+   根因是**同时对比**：一块中性灰挨着白底，感知上一定比色值更黑。所以不是
+   "灰没选对"，而是"不该用灰度表达选中"。v5 改用对勾 + 加厚描边 + 加粗字。
+   断言守的就是这个决定：
+     - 底必须是极浅（不能再回到任何"填充"—— 那是已证伪的方向）
+     - 描边必须是硬黑且 2px（形状信号的主体）
+     - 必须有对勾（::before）
+     - 文字与底仍要过 AA */
 const chipOn = /\.cmdgo-vchip\.on\{([^}]*)\}/.exec(consoleCss)
 const chipBg = chipOn === null ? '' : (/background:(#[0-9a-f]{6})/.exec(chipOn[1]) || [])[1]
 // ⚠️ 不能用 /color:(#…)/ —— 那会先命中 `border-color:`。必须锚在分号/花括号之后。
 const chipFg = chipOn === null ? '' : (/(?:^|;)color:(#[0-9a-f]{3,6})/.exec(chipOn[1]) || [])[1]
-check('厂家芯片选中态是实心填充（浅色底对白底只有 1.13，看不出选中）',
-  chipBg !== undefined && !['#ffffff', '#f1f1f4', '#ececf0', '#e8e8ee', '#e4e4ea'].includes(chipBg),
-  'background=' + String(chipBg))
-check('厂家芯片选中态不用纯黑（纯黑只留给主按钮/主徽标）',
-  chipBg !== '#0a0a0c', 'background=' + String(chipBg))
 /** WCAG 相对亮度 → 对比度。用真实公式，不靠肉眼估。 */
 const srgb = (v) => { const s = v / 255; return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4 }
 /** 展开 3 位简写（#fff → #ffffff）；CSS 简写很常见，不展开会算错。 */
@@ -398,9 +396,24 @@ const contrast = (a, b) => {
   const la = relLum(a), lb = relLum(b)
   return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
 }
-check('选中态文字与填充的对比度过 WCAG AA（≥4.5，11px 正常字）',
+check('选中芯片不再用灰度填充（中性灰挨白底必然被看成更黑，已证伪四版）',
+  chipBg !== undefined && contrast('#ffffff', chipBg) < 1.2,
+  '背景 ' + String(chipBg) + ' 对白底 ' + (chipBg ? contrast('#ffffff', chipBg).toFixed(2) : '?'))
+check('选中芯片靠 2px 硬黑描边承载形状信号',
+  /\.cmdgo-vchip\.on\{[^}]*border-color:#0a0a0c/.test(consoleCss)
+  && /\.cmdgo-vchip\{[^}]*border:2px solid/.test(consoleCss),
+  '未选中与选中都应是 2px（只换色不换粗细，避免横向抖动）')
+check('选中芯片带对勾（0/1 的二值信号，不依赖灰度比较）',
+  /\.cmdgo-vchip\.on::before\{[^}]*content:'✓'/.test(consoleCss))
+check('选中芯片文字加粗（第三层形状信号）',
+  /\.cmdgo-vchip\.on\{[^}]*font-weight:700/.test(consoleCss))
+check('选中芯片文字与底对比度过 WCAG AA（≥4.5）',
   chipBg !== undefined && chipFg !== undefined && contrast(chipBg, chipFg) >= 4.5,
   `背景 ${chipBg} / 文字 ${chipFg} = ${chipBg && chipFg ? contrast(chipBg, chipFg).toFixed(2) : '?'}`)
+const chipSource = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+check('选中芯片暴露 aria-pressed（对勾只是视觉，读屏要靠它）',
+  /'aria-pressed': modelVendorFilter === ''/.test(chipSource)
+  && /'aria-pressed': modelVendorFilter === entry\[0\]/.test(chipSource))
 check('选中态与 hover 可区分（hover 只改描边/文字，底仍是白）',
   /\.cmdgo-vchip:hover\{[^}]*border-color:#0a0a0c/.test(consoleCss)
   && !/\.cmdgo-vchip:hover\{[^}]*background:/.test(consoleCss))
