@@ -32,6 +32,7 @@ import type {} from '@deepseek-ai/dsh-settings'
 import { CommandCodeGoAdapter, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from './adapter.js'
 import type { CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js'
 import { applyModalities, fetchAllModels, fetchCatalog, fetchCatalogModalities, hasKnownModality, selectGoModels } from './models.js'
+import type { ModelPricing } from './models.js'
 import { DEFAULT_STUDIO_BASE, CommandCodeLoginManager } from './oauth.js'
 import type { LoginSuccessInfo, LoginStatus } from './oauth.js'
 import { AccountPool } from './pool.js'
@@ -42,6 +43,7 @@ import { CallMeter } from './meter.js'
 import type { MeterSnapshot } from './meter.js'
 import { RequestStats } from './request-stats.js'
 import type { RequestStatsView } from './request-stats.js'
+import { CmdgoPrefs } from './prefs.js'
 import type { GoModel } from './models.js'
 import type { ImageResolver } from './protocol.js'
 
@@ -51,7 +53,8 @@ export {
   DEFAULT_MAX_TOKENS,
 } from './adapter.js'
 export type { CommandCodeGoAdapterOptions, CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js'
-export { fetchCatalog, fetchCatalogEfforts, fetchGoModels, isGoModel, parseCatalogEfforts, parseCatalogPlans, selectGoModels } from './models.js'
+export { fetchCatalog, fetchCatalogEfforts, fetchGoModels, isGoModel, parseCatalogEfforts, parseCatalogPlans, parseCatalogPricing, selectGoModels } from './models.js'
+export type { ModelPricing } from './models.js'
 export { CommandCodeLoginManager, DEFAULT_STUDIO_BASE } from './oauth.js'
 export type { LoginStatus, LoginSuccessInfo } from './oauth.js'
 export { UsageReader, normalizeUsage, resolvePlan } from './usage.js'
@@ -424,6 +427,13 @@ export function apply(ctx: Context, config: Config): void {
   // 纯内存，进程内有效；不落盘、不含凭据。
   const requestStats = new RequestStats()
 
+  // --- 用户偏好：模型可见性（黑名单）+ 会话头部 HUD 开关 ---
+  // 落盘 ~/.dsh/cmdgo-prefs.json。模型开关只影响 profile 里的目录展示，
+  // 不参与请求路由（见 adapter.listModels 注释）。
+  const prefs = new CmdgoPrefs(undefined, (message) => { ctx.logger.info(message) })
+  // 立即加载：listModels() 可能在首个请求就同步读取 hiddenIds。
+  void prefs.ensureLoaded()
+
   /** 取账号的 API key；池账号与主 ref 通用（只用 account.ref）。 */
   const accountKey = async (account: { ref: CredentialRef }): Promise<string | undefined> => {
     const credentials = ctx.get('credentials')
@@ -567,6 +577,17 @@ export function apply(ctx: Context, config: Config): void {
     cache: RequestStatsView
     /** 最近一次目录同步的错误；为空表示目录已就绪。 */
     catalogError?: string
+    /** 当前**可见**的模型 id（已应用模型开关），供设置页渲染开关列表。 */
+    models: string[]
+    /**
+     * 每个模型的每 100 万 token 费率，按模型 id 索引。
+     *
+     * 只有官方 CLI 目录到货的模型才在表里 —— 拿不到目录时整个字段为空对象，
+     * 设置页据此不显示价格（而不是显示 0）。
+     */
+    pricing: Record<string, ModelPricing>
+    /** 用户偏好：关闭的模型 + HUD 开关。 */
+    prefs: { hiddenModels: string[]; hudEnabled: boolean }
   }> {
     const ref = currentRef()
     const credentials = ctx.get('credentials')
@@ -618,6 +639,15 @@ export function apply(ctx: Context, config: Config): void {
       meter: meter.snapshot(),
       cache: requestStats.view(forSessionId),
       accounts: rows,
+      // 完整目录（含被关闭的）：设置页要能列出隐藏项才能把它们打开。
+      models: scanned.map((model) => model.id),
+      // 费率表：只含官方目录公布过价格的模型。
+      pricing: Object.fromEntries(
+        scanned
+          .filter((model): model is typeof model & { pricing: ModelPricing } => model.pricing !== undefined)
+          .map((model) => [model.id, model.pricing]),
+      ),
+      prefs: prefs.snapshot(),
     }
   }
 
@@ -761,6 +791,45 @@ export function apply(ctx: Context, config: Config): void {
             sendJson(rawRes, 200, { ok: true, removed })
             return
           }
+          // --- 模型开关 ---
+          // 关闭/打开单个模型。语义为黑名单：只有被显式关闭的才进 hidden。
+          if (req.method === 'POST' && action === '/model/toggle') {
+            const body = await readJson(req)
+            const id = typeof body.id === 'string' ? body.id : ''
+            if (id.length === 0) {
+              sendJson(rawRes, 400, { ok: false, error: 'missing id' })
+              return
+            }
+            await prefs.setModelHidden(id, body.hidden === true)
+            // 目录变了要让 Models 页与 composer 立刻重取：replace 会广播
+            // `llm/adapters-updated`，客户端的 catalog.refresh() 随之触发。
+            registration.replace([PROVIDER])
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
+          // 批量关闭当前目录里的全部模型（「全部关闭」）。
+          if (req.method === 'POST' && action === '/model/hide-all') {
+            await readJson(req)
+            await prefs.hideMany(scanned.map((model) => model.id))
+            registration.replace([PROVIDER])
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
+          // 清空黑名单（「全部打开」）。刻意不看当前目录，直接清空所有键。
+          if (req.method === 'POST' && action === '/model/show-all') {
+            await readJson(req)
+            await prefs.clearHidden()
+            registration.replace([PROVIDER])
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
+          // --- 会话头部 HUD 开关 ---
+          if (req.method === 'POST' && action === '/hud/toggle') {
+            const body = await readJson(req)
+            await prefs.setHudEnabled(body.enabled !== false)
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
           sendJson(rawRes, 404, { ok: false, error: `unknown action: ${action}` })
         } catch (error) {
           sendJson(rawRes, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
@@ -856,6 +925,8 @@ export function apply(ctx: Context, config: Config): void {
     resolveApiKey,
     resolveImage,
     poolSize: () => Math.max(1, pool.size),
+    // 模型开关：只过滤 listModels() 的目录展示，不影响请求路由。
+    hiddenIds: () => prefs.hiddenIds,
     onKeySuccess: async (apiKey) => {
       const account = await accountForKey(apiKey)
       if (account !== undefined) {
@@ -985,15 +1056,23 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /** 把目录条目转成 adapter 视图；effort 可用时一并带上。 */
-  const toScanned = (entries: readonly GoModel[], efforts?: ReadonlyMap<string, string[]>): CommandCodeGoModel[] =>
+  /** 把目录条目转成 adapter 视图；effort / 价格可用时一并带上。 */
+  const toScanned = (
+    entries: readonly GoModel[],
+    efforts?: ReadonlyMap<string, string[]>,
+    pricing?: ReadonlyMap<string, ModelPricing>,
+  ): CommandCodeGoModel[] =>
     entries.map((entry) => {
       const effort = efforts?.get(entry.id)
+      // 价格优先用官方表里的（实时），退回到条目自带的（离线快照）。
+      const rate = pricing?.get(entry.id) ?? entry.pricing
       return {
         id: entry.id,
         name: entry.name,
         contextWindow: entry.contextWindow,
         inputModalities: entry.inputModalities,
         ...(effort === undefined ? {} : { efforts: effort }),
+        ...(rate === undefined ? {} : { pricing: rate }),
       }
     })
 
@@ -1051,12 +1130,13 @@ export function apply(ctx: Context, config: Config): void {
       throw new Error('no Go models found; keeping the previous catalog')
     }
     publish(toScanned(entries))
-    // effort 与档位来自同一张官方表，一次抓取同时得到两者。
+    // effort / 档位 / 费率来自同一张官方表，一次抓取同时得到三者。
     // 尽力而为：慢或被墙都不影响已经可用的模型列表。
     let efforts: Map<string, string[]> | undefined
+    let pricing: Map<string, ModelPricing> | undefined
     let plans: Map<string, boolean> | undefined
     try {
-      ({ efforts, plans } = await fetchCatalog())
+      ({ efforts, pricing, plans } = await fetchCatalog())
     } catch (error) {
       ctx.logger.warn('[cmdgo] effort catalog scan failed: %s', error instanceof Error ? error.message : String(error))
     }
@@ -1069,14 +1149,14 @@ export function apply(ctx: Context, config: Config): void {
         ctx.logger.warn('[cmdgo] 官方档位表把所有模型都判为非 Go，沿用静态规则结果')
       } else {
         entries = overlaid
-        publish(toScanned(entries, efforts))
+        publish(toScanned(entries, efforts, pricing))
       }
-    } else if (efforts !== undefined) {
-      publish(toScanned(entries, efforts))
+    } else if (efforts !== undefined || pricing !== undefined) {
+      publish(toScanned(entries, efforts, pricing))
     }
     // 目录出现快照未知的模型时，才补拉实时模态注册表。
     const live = await ensureModalities(entries.map(entry => entry.id))
-    if (live !== undefined) publish(toScanned(applyModalities(entries, live), efforts))
+    if (live !== undefined) publish(toScanned(applyModalities(entries, live), efforts, pricing))
   }
 
   // 首扫失败必须快速重试：设备刚启动时网络往往还没就绪，若沿用 15 分钟周期，

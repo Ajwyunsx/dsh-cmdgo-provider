@@ -35,7 +35,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import { buildRequest, CC_VERSION, DEFAULT_MAX_TOKENS, eventToChunks, gatewayErrorMessage, gatewayEventHasVisibleOutput, parseEventStream, streamErrorCode, streamErrorText, usageSummary } from './protocol.js'
 import type { CcStreamState, CcUsageSummary, ImageResolver, RequestRepair, CompatibleContentBlock as ContentBlock, CompatibleMessage as Message } from './protocol.js'
-import type { ModelInputModality } from './models.js'
+import type { ModelInputModality, ModelPricing } from './models.js'
 
 /** One catalog model advertised by the adapter. */
 export interface CommandCodeGoModel {
@@ -51,6 +51,14 @@ export interface CommandCodeGoModel {
   efforts?: string[]
   /** Input modalities the model accepts; defaults to text-only. */
   inputModalities?: readonly ModelInputModality[]
+  /**
+   * 官方 CLI catalog 公布的每 100 万 token 费率（美元）。
+   *
+   * **刻意不放进 `LlmModelInfo`**：上游那个接口没有计价字段，也很可能永远不会有
+   * （harness 对不同 provider 的计价方式没有共识）。它只用于本插件自己的设置页，
+   * 由 `/api/cmdgo/status` 单独投影给客户端。
+   */
+  pricing?: ModelPricing
 }
 
 /** Validated connection facts for one operation. */
@@ -77,6 +85,11 @@ export interface CommandCodeGoAdapterOptions {
   resolveApiKey: () => Promise<string>
   /** Account-pool size; bounds per-request failover attempts (default 1). */
   poolSize?: () => number
+  /**
+   * 被用户关闭的模型 id 集合（黑名单）。缺省时不过滤 —— 目录原样输出。
+   * 只影响 {@link CommandCodeGoAdapter.listModels}，不参与请求校验。
+   */
+  hiddenIds?: () => ReadonlySet<string>
   /** The gateway accepted a request under this key — clear its failure bookkeeping. */
   onKeySuccess?: (apiKey: string) => void | Promise<void>
   /** A request failed on this key before the first byte — cool the account down. */
@@ -270,8 +283,24 @@ export class CommandCodeGoAdapter extends LlmAdapter {
     return this.config.options().retryPolicy
   }
 
+  /**
+   * Advisory model catalog for the Models page and the composer picker.
+   *
+   * 这里同时是「模型开关」的**唯一过滤点**：用户在设置页关掉的模型只从
+   * 这里消失（`hiddenIds`），`resolveModel()` / 请求路由完全不受影响 ——
+   * 与 codearts 的取舍一致：目录成员资格是建议性的，不该锁死已有会话的模型，
+   * 否则关掉一个正在用的模型会让那个会话直接报错。
+   *
+   * @param provider - one provider route owned by this adapter.
+   * @returns 可见模型，按适配器偏好顺序；关闭的模型被原地跳过。
+   */
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve(this.config.options().models.map(model => modelInfo(provider, model)))
+    const models = this.config.options().models
+    const hidden = this.config.hiddenIds?.()
+    const listed = hidden === undefined || hidden.size === 0
+      ? models
+      : models.filter(model => !hidden.has(model.id))
+    return Promise.resolve(listed.map(model => modelInfo(provider, model)))
   }
 
   override resolveModel(
