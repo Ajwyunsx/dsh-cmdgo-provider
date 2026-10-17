@@ -364,13 +364,23 @@ async function imageParts(blocks: ImageBlock[], resolveImage?: ImageResolver): P
  *
  * `pairing` 会把「没有对应工具调用的结果」和重复 id 丢掉：网关要求双向配对，
  * 反向孤儿同样会让整轮失败。被丢掉的结果里嵌的图片也一并不发（见 collectImages）。
+ *
+ * 返回的两个部分是**分开**给调用方的：`tool` 必须挤进 assistant 后面那段连续的
+ * tool 结果里，而 `follow` 得等整段发完再发（原因见 buildRequest 的 deferred）。
  */
+interface SerializedUser {
+  /** 本条消息的工具结果（`tool` 角色）；没有工具结果时为 undefined。 */
+  tool?: Extract<CcMessage, { role: 'tool' }>
+  /** 紧随其后的文本/图片（`user` 角色）；都没有时为 undefined。 */
+  follow?: Extract<CcMessage, { role: 'user' }>
+}
+
 async function serializeUser(
   message: Message,
   resolveImage?: ImageResolver,
   pairing?: ToolPairing,
-): Promise<CcMessage[]> {
-  const out: CcMessage[] = []
+): Promise<SerializedUser> {
+  const out: SerializedUser = {}
   const kept: Array<Extract<ContentBlock, { type: 'tool-result' }>> = []
   const keptBlocks = new Set<ContentBlock>()
   for (const block of message.content) {
@@ -385,7 +395,7 @@ async function serializeUser(
     kept.push(block)
   }
   if (kept.length > 0) {
-    out.push({
+    out.tool = {
       role: 'tool',
       content: kept.map(result => ({
         type: 'tool-result' as const,
@@ -393,7 +403,7 @@ async function serializeUser(
         toolName: 'unknown',
         output: toolResultOutput(result),
       })),
-    })
+    }
   }
   const text = flattenText(message.content)
   const images = await imageParts(collectImages(message.content, keptBlocks), resolveImage)
@@ -403,13 +413,13 @@ async function serializeUser(
       ...images,
     ]
     const single = parts.length === 1 ? parts[0] : undefined
-    out.push({
+    out.follow = {
       role: 'user',
       content: single !== undefined && single.type === 'text' ? single.text : parts,
-    })
+    }
   }
   // 空消息也要占位，否则整轮会塌陷。
-  if (out.length === 0) out.push({ role: 'user', content: '' })
+  if (out.tool === undefined && out.follow === undefined) out.follow = { role: 'user', content: '' }
   return out
 }
 
@@ -459,18 +469,41 @@ export async function buildRequest(
       }
     : message)
   const pairing = pairingFor(history, repair?.dropToolCallIds)
+  // 工具结果里嵌的图片/文本会顺带生成一条 `user` 消息（见 serializeUser）。它必须
+  // 等**整段工具结果**都发完再发：网关只在「assistant 的 tool-call 后面紧跟同 id 的
+  // tool-result、中间不夹别的角色」时才认配对。夹一条 user 进去，后面那些调用就会
+  // 被判成
+  //   {"type":"error","error":{"type":"server_error",
+  //    "message":"Tool result is missing for tool call …"}}
+  // 适配器只好自愈：把那个调用**连同它的结果**一起丢掉再重发。模型于是看到自己上一轮
+  // 的工具调用凭空消失，经常就此不再调用工具、只吐一段推理然后 stop —— harness 收到
+  // 的 assistant 消息里既没有 text 也没有 tool-call，turn 就被记成 completed，界面像
+  // 卡住了（实测 88 个 turn 里 8 个）。这里把顺序修正到发出前，从根上不触发那次自愈。
+  const deferred: CcMessage[] = []
+  const flushDeferred = (): void => {
+    if (deferred.length > 0) messages.push(...deferred.splice(0, deferred.length))
+  }
   for (const message of history) {
     if (message.role === 'system') {
       system += (system ? '\n\n' : '') + flattenText(message.content)
       continue
     }
     if (message.role === 'assistant') {
+      flushDeferred()
       const serialized = serializeAssistant(message, pairing)
       if (serialized !== undefined) messages.push(serialized)
       continue
     }
-    messages.push(...await serializeUser(message, resolveImage, pairing))
+    const { tool, follow } = await serializeUser(message, resolveImage, pairing)
+    if (tool !== undefined) {
+      messages.push(tool)
+      if (follow !== undefined) deferred.push(follow)
+    } else {
+      flushDeferred()
+      if (follow !== undefined) messages.push(follow)
+    }
   }
+  flushDeferred()
 
   const tools: CcTool[] = (options.tools ?? [])
     .map((tool: ToolSchema) => ({

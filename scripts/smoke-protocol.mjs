@@ -96,6 +96,34 @@ const multiNative = await request([
 ])
 check('连续步骤的历史调用和结果完整配对', rounds(pairingOf(multiNative).calls) === 'first,second' && rounds(pairingOf(multiNative).results) === 'first,second')
 
+/* ---------- [A1] 工具结果与图片的排序（网关的配对是「紧邻」判定） ---------- */
+console.log('[A1] 并行调用 + 结果内嵌图片时，user 消息不许插进 tool 结果中间')
+
+/**
+ * 工具结果里嵌的图片会额外产生一条 `user` 消息。若它紧跟在对应 `tool` 之后，
+ * 后面那些调用的结果就被一条 user 隔开，网关判「Tool result is missing」，
+ * 适配器只好把那个调用连结果一起丢掉重发 —— 模型看到的历史是坏的，于是不再
+ * 调工具、只吐一段推理就收尾（turn 被记成 completed）。
+ *
+ * 断言的是**网关实际收到的 body**，不是我们刚写的代码：assistant 之后必须先把
+ * 连续的 `tool` 消息全部走完，才允许出现 `user`。
+ */
+const interleaved = await request([
+  { role: 'assistant', content: [call('p1'), call('p2')] },
+  { role: 'user', content: [{ type: 'tool-result', toolCallId: 'p1', toolName: 'screenshot', isError: false, content: [image('img-p1'), { type: 'text', text: 'shot 1' }] }] },
+  { role: 'user', content: [{ type: 'tool-result', toolCallId: 'p2', toolName: 'screenshot', isError: false, content: [image('img-p2'), { type: 'text', text: 'shot 2' }] }] },
+], async () => 'data:image/png;base64,AAAA')
+const roles = interleaved.params.messages.map(message => message.role)
+const callIdx = roles.indexOf('assistant')
+let toolRun = 0
+for (let i = callIdx + 1; i < roles.length && roles[i] === 'tool'; i++) toolRun += 1
+check('两条结果在 assistant 之后紧邻、不夹 user', toolRun === 2, 'roles=' + JSON.stringify(roles))
+check('结果里的图片仍然发出（排序修正没有吞图）',
+  (JSON.stringify(interleaved.params.messages).match(/data:image\/png;base64,AAAA/g) ?? []).length === 2)
+check('配对仍是 p1,p2', rounds(pairingOf(interleaved).results) === 'p1,p2')
+check('图片消息排在整段 tool 结果之后',
+  roles.indexOf('user', callIdx) > callIdx + 2, 'roles=' + JSON.stringify(roles))
+
 /* ---------- [A] 工具调用双射 ---------- */
 console.log('[A] 工具调用双射（issue #5）')
 
