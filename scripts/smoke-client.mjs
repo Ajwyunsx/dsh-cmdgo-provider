@@ -340,6 +340,22 @@ check('HUD 样式独立注入且含主题变量',
   'style id missing')
 check('设置页 .cmdgo-* 基础样式一并注入（面板复用 QuotaBlock）',
   (styleNodes.get('cmdgo-console-style') || {}).textContent?.includes('.cmdgo-qrow') === true)
+/* 原生控件的配色锚点。
+   宿主在 :root 上按主题设 color-scheme，它会**继承**进本分区：深色主题下
+   <select> 的弹出菜单与滚动条会渲染成深色，压在固定的白色卡片上（用户报障过）。
+   .cmdgo 必须显式声明 light。这条断言防的是「哪天有人觉得这行没用顺手删掉」——
+   删了在浅色主题下完全看不出来，只有深色主题的用户会看到一块深色菜单。 */
+const consoleCss = (styleNodes.get('cmdgo-console-style') || {}).textContent || ''
+check('.cmdgo 锚定 color-scheme:light（否则深色宿主下原生下拉/滚动条翻转成深色）',
+  /\.cmdgo\{[^}]*color-scheme:light/.test(consoleCss),
+  'CSS 里找不到 .cmdgo{…color-scheme:light…}')
+check('模型列表滚动条显式配色（不用浏览器默认灰色块）',
+  consoleCss.includes('.cmdgo-models::-webkit-scrollbar-thumb'))
+check('厂家下拉框接管原生外观（原生弹层在深色宿主下无法用 CSS 控制）',
+  /\.cmdgo-search select\{[^}]*appearance:none/.test(consoleCss),
+  'CSS 里找不到 .cmdgo-search select{…appearance:none…}')
+check('下拉选项钉死浅色底/字（Windows Chromium 会沿用 color 计算弹层）',
+  /\.cmdgo-search select option\{[^}]*background-color:#fff/.test(consoleCss))
 check('渲染次数 > 0', renders > 0)
 
 /* 清掉注册的 effect 清理函数，避免桩里的订阅残留。 */
