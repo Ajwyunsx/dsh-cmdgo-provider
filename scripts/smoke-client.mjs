@@ -364,17 +364,46 @@ check('厂家芯片横向滚动条与模型列表同色（两处并排不能有�
      v2 浅灰底（#f1f1f4）   → 对白底只有 1.13 对比度，用户看不出哪个被选中
      v3 深灰填充（#3f3f46） → 实心感够、又比纯黑柔一层（与白字对比 10.44 vs 19.78）
    所以既不能退回浅灰（丢可辨识性），也不能退回纯黑（丢层级）。 */
-check('厂家芯片选中态是实心填充（不是浅灰底，浅灰对白底只有 1.13 对比度看不出来）',
-  /\.cmdgo-vchip\.on\{[^}]*background:#(?!fff|f1f1f4|ececf0|e8e8ee|e4e4ea)[0-9a-f]{6}/.test(consoleCss),
-  '选中态必须有实心深色底')
-check('厂家芯片选中态不用纯黑（纯黑只留给主按钮/主徽标，芯片是次级控件）',
-  !/\.cmdgo-vchip\.on\{[^}]*background:#0a0a0c/.test(consoleCss),
-  '选中态不该用 #0a0a0c 填充')
+/* 选中芯片：必须是实心填充，且填充灰度要过 WCAG AA。
+   这一格来回改过四次，每次都是一个真实的失败方向，所以断言守的是**双向边界**：
+     v1 #0a0a0c 纯黑   白字 19.78 → 太硬（"全黑不太好看"）
+     v2 #f1f1f4 浅灰   底vs白底 1.13 → 看不出选中（"看不出被选中"）
+     v3 #3f3f46 深灰   白字 10.44 → 看得清但偏重（"尤其的灰"）
+     v4 #6e6e79 中灰   白字 5.04 → 更浅且仍过 AA ← 当前
+   所以：
+     - 底不能是浅色档（防退回 v2 那种看不出来的状态）
+     - 底不能是纯黑（防退回 v1）
+     - 若配白字，底必须够深（白字对比 ≥4.5，防退到 #7a7a85 那种读不清的档） */
+const chipOn = /\.cmdgo-vchip\.on\{([^}]*)\}/.exec(consoleCss)
+const chipBg = chipOn === null ? '' : (/background:(#[0-9a-f]{6})/.exec(chipOn[1]) || [])[1]
+// ⚠️ 不能用 /color:(#…)/ —— 那会先命中 `border-color:`。必须锚在分号/花括号之后。
+const chipFg = chipOn === null ? '' : (/(?:^|;)color:(#[0-9a-f]{3,6})/.exec(chipOn[1]) || [])[1]
+check('厂家芯片选中态是实心填充（浅色底对白底只有 1.13，看不出选中）',
+  chipBg !== undefined && !['#ffffff', '#f1f1f4', '#ececf0', '#e8e8ee', '#e4e4ea'].includes(chipBg),
+  'background=' + String(chipBg))
+check('厂家芯片选中态不用纯黑（纯黑只留给主按钮/主徽标）',
+  chipBg !== '#0a0a0c', 'background=' + String(chipBg))
+/** WCAG 相对亮度 → 对比度。用真实公式，不靠肉眼估。 */
+const srgb = (v) => { const s = v / 255; return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4 }
+/** 展开 3 位简写（#fff → #ffffff）；CSS 简写很常见，不展开会算错。 */
+const expandHex = (hex) => hex.length === 4
+  ? '#' + hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3]
+  : hex
+const relLum = (hex) => {
+  const full = expandHex(hex)
+  const n = parseInt(full.slice(1), 16)
+  return 0.2126 * srgb((n >> 16) & 255) + 0.7152 * srgb((n >> 8) & 255) + 0.0722 * srgb(n & 255)
+}
+const contrast = (a, b) => {
+  const la = relLum(a), lb = relLum(b)
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+}
+check('选中态文字与填充的对比度过 WCAG AA（≥4.5，11px 正常字）',
+  chipBg !== undefined && chipFg !== undefined && contrast(chipBg, chipFg) >= 4.5,
+  `背景 ${chipBg} / 文字 ${chipFg} = ${chipBg && chipFg ? contrast(chipBg, chipFg).toFixed(2) : '?'}`)
 check('选中态与 hover 可区分（hover 只改描边/文字，底仍是白）',
   /\.cmdgo-vchip:hover\{[^}]*border-color:#0a0a0c/.test(consoleCss)
   && !/\.cmdgo-vchip:hover\{[^}]*background:/.test(consoleCss))
-check('选中态的白字压得住深底（填充够深才配白字）',
-  /\.cmdgo-vchip\.on\{[^}]*color:#fff/.test(consoleCss))
 check('厂家下拉框接管原生外观（原生弹层在深色宿主下无法用 CSS 控制）',
   /\.cmdgo-search select\{[^}]*appearance:none/.test(consoleCss),
   'CSS 里找不到 .cmdgo-search select{…appearance:none…}')
