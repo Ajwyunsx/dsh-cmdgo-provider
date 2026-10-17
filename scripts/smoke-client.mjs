@@ -354,6 +354,17 @@ check('模型列表滚动条显式配色（不用浏览器默认灰色块）',
 check('厂家芯片横向滚动条与模型列表同色（两处并排不能有色差）',
   /\.cmdgo-vendors::-webkit-scrollbar-thumb\{[^}]*#e5e5e5/.test(consoleCss),
   '横向滚动条 thumb 不是 #e5e5e5')
+/* 选中芯片不能是纯黑填充。
+   纯黑填充在这套配色里只属于主按钮与主徽标；芯片是次级控件，一整块纯黑会在
+   浅色卡片上成为最重的元素，把视线从模型列表抢走（用户明确反馈过"全黑不好看"）。
+   选中态靠「浅灰底 + 硬黑描边 + ink 文字」三件事同时成立来区分，强度够了。 */
+check('厂家芯片选中态是浅灰底而非纯黑填充（纯黑只留给主按钮/主徽标）',
+  /\.cmdgo-vchip\.on\{[^}]*background:#f1f1f4/.test(consoleCss)
+  && !/\.cmdgo-vchip\.on\{[^}]*background:#0a0a0c/.test(consoleCss),
+  '选中态不该用 #0a0a0c 填充')
+check('选中态与 hover 可区分（hover 只改描边/文字，底仍是白）',
+  /\.cmdgo-vchip:hover\{[^}]*border-color:#0a0a0c/.test(consoleCss)
+  && !/\.cmdgo-vchip:hover\{[^}]*background:/.test(consoleCss))
 check('厂家下拉框接管原生外观（原生弹层在深色宿主下无法用 CSS 控制）',
   /\.cmdgo-search select\{[^}]*appearance:none/.test(consoleCss),
   'CSS 里找不到 .cmdgo-search select{…appearance:none…}')
