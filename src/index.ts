@@ -43,7 +43,7 @@ import { CallMeter } from './meter.js'
 import type { MeterSnapshot } from './meter.js'
 import { RequestStats } from './request-stats.js'
 import type { RequestStatsView } from './request-stats.js'
-import { CmdgoPrefs } from './prefs.js'
+import { CmdgoPrefs, isCmdgoThemePreference, type CmdgoThemePreference } from './prefs.js'
 import type { GoModel } from './models.js'
 import type { ImageResolver } from './protocol.js'
 
@@ -586,8 +586,8 @@ export function apply(ctx: Context, config: Config): void {
      * 设置页据此不显示价格（而不是显示 0）。
      */
     pricing: Record<string, ModelPricing>
-    /** 用户偏好：关闭的模型 + HUD 开关。 */
-    prefs: { hiddenModels: string[]; hudEnabled: boolean }
+    /** 用户偏好：关闭的模型 + HUD 开关 + 设置页配色方案。 */
+    prefs: { hiddenModels: string[]; hudEnabled: boolean; theme: CmdgoThemePreference }
   }> {
     const ref = currentRef()
     const credentials = ctx.get('credentials')
@@ -827,6 +827,22 @@ export function apply(ctx: Context, config: Config): void {
           if (req.method === 'POST' && action === '/hud/toggle') {
             const body = await readJson(req)
             await prefs.setHudEnabled(body.enabled !== false)
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
+          // --- 设置页配色方案（light / dark / system） ---
+          // 只存偏好，不碰宿主的主题：本插件自己的面板可以独立于 harness 的
+          // 外观设置（见 prefs.ts 的 CmdgoThemePreference 注释）。
+          if (req.method === 'POST' && action === '/theme/set') {
+            const body = await readJson(req)
+            // 边界校验：body 来自 HTTP，可能是任意值。认不出来就 400，
+            // 而不是静默写一个脏值进存档（那样下次启动会退回默认，用户会
+            // 觉得"点了没反应"）。
+            if (!isCmdgoThemePreference(body.theme)) {
+              sendJson(rawRes, 400, { ok: false, error: 'invalid theme' })
+              return
+            }
+            await prefs.setThemePreference(body.theme)
             sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
             return
           }

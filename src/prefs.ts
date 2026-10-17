@@ -1,5 +1,5 @@
 /**
- * 用户偏好：模型可见性 + 会话头部 HUD 开关。
+ * 用户偏好：模型可见性 + 会话头部 HUD 开关 + 配色方案。
  *
  * 与 `pool.ts` / `meter.ts` 同构：状态落在 `~/.dsh/cmdgo-prefs.json`，
  * 使用 `homedir()` 而不是 `DSH_HOME`（与那两个文件保持一致，便于一起备份）。
@@ -23,10 +23,40 @@ export interface CmdgoPrefsFile {
   hiddenModels: string[]
   /** 会话头部额度胶囊是否显示。 */
   hudEnabled: boolean
+  /** 设置页配色方案。缺省（老文件没有这个键）= `system`。 */
+  theme?: CmdgoThemePreference
+}
+
+/**
+ * 设置页的配色方案。
+ *
+ * 与宿主的 `ui-theme` 偏好**同名同义**（`light` / `dark` / `system`），
+ * 但它是本插件自己的存档：插件分区在设置页里是独立的一块视觉，
+ * 用户可能想让 harness 保持深色、而这块面板用浅色（或反过来）。
+ * 默认 `system` —— 与宿主默认值一致，装上即"跟随系统"。
+ */
+export type CmdgoThemePreference = 'light' | 'dark' | 'system'
+
+/** 可接受的配色方案（顺序即 UI 里三个按钮的顺序）。 */
+export const CMDGO_THEME_PREFERENCES: readonly CmdgoThemePreference[] = ['light', 'dark', 'system']
+
+/** 无存档时的配色方案：跟随系统（与宿主 `DEFAULT_PREFERENCE` 对齐）。 */
+export const DEFAULT_CMDGO_THEME: CmdgoThemePreference = 'system'
+
+/**
+ * 把一个跨越边界的值收敛成可落盘的配色方案。
+ *
+ * 边界上的值来自 HTTP body 或磁盘上的旧文件，两者都可能是任意值；
+ * 认不出来就退回默认的 `system`，绝不把脏值写进存档。
+ * @param value - HTTP body 或存档里的原始值。
+ * @returns 合法的配色方案；无法识别时返回默认值。
+ */
+export function isCmdgoThemePreference(value: unknown): value is CmdgoThemePreference {
+  return typeof value === 'string' && (CMDGO_THEME_PREFERENCES as readonly string[]).includes(value)
 }
 
 /** 保守解析：任何意外形状都退回默认值，绝不让坏文件拖垮启动。 */
-function parsePrefs(raw: string): { hiddenModels: string[]; hudEnabled: boolean } {
+function parsePrefs(raw: string): { hiddenModels: string[]; hudEnabled: boolean; theme: CmdgoThemePreference } {
   const parsed: unknown = JSON.parse(raw)
   const record = (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed))
     ? parsed as Record<string, unknown>
@@ -38,6 +68,8 @@ function parsePrefs(raw: string): { hiddenModels: string[]; hudEnabled: boolean 
     hiddenModels,
     // 缺省为显示：只有显式写 false 才隐藏（老文件没有这个键 → 保持可见）。
     hudEnabled: record.hudEnabled !== false,
+    // 缺省为跟随系统：老文件没有这个键 → 与宿主默认值一致。
+    theme: isCmdgoThemePreference(record.theme) ? record.theme : DEFAULT_CMDGO_THEME,
   }
 }
 
@@ -50,6 +82,7 @@ function parsePrefs(raw: string): { hiddenModels: string[]; hudEnabled: boolean 
 export class CmdgoPrefs {
   private hidden = new Set<string>()
   private hud = true
+  private themeMode: CmdgoThemePreference = DEFAULT_CMDGO_THEME
   private loaded = false
   /** 进行中的加载；并发调用共享同一个 promise，避免读到半载文件。 */
   private loading: Promise<void> | undefined
@@ -68,10 +101,12 @@ export class CmdgoPrefs {
         const parsed = parsePrefs(await readFile(this.file, 'utf8'))
         this.hidden = new Set(parsed.hiddenModels)
         this.hud = parsed.hudEnabled
+        this.themeMode = parsed.theme
       } catch (_missingOrCorrupt) {
-        // 文件不存在或损坏：用默认值（全部可见 + HUD 开）。
+        // 文件不存在或损坏：用默认值（全部可见 + HUD 开 + 跟随系统）。
         this.hidden = new Set()
         this.hud = true
+        this.themeMode = DEFAULT_CMDGO_THEME
       }
       this.loaded = true
       this.loading = undefined
@@ -84,6 +119,7 @@ export class CmdgoPrefs {
       version: 1,
       hiddenModels: [...this.hidden].sort(),
       hudEnabled: this.hud,
+      theme: this.themeMode,
     }
     const text = JSON.stringify(payload, null, 2)
     try {
@@ -104,6 +140,11 @@ export class CmdgoPrefs {
 
   get hudEnabled(): boolean {
     return this.hud
+  }
+
+  /** 当前配色方案偏好（`light` / `dark` / `system`）。 */
+  get themePreference(): CmdgoThemePreference {
+    return this.themeMode
   }
 
   /** 某个模型当前是否可见。 */
@@ -158,8 +199,22 @@ export class CmdgoPrefs {
     await this.persist()
   }
 
+  /**
+   * 设置配色方案。
+   *
+   * 这里**不做取值校验**：`themeMode` 的类型已经把它收窄到位，而真正跨越
+   * 边界的是 HTTP body —— 那一层由 `isCmdgoThemePreference()` 收敛（见 index.ts
+   * 的 `/theme/set`）。校验放在边界上，这里保持"写一个已知合法的值"。
+   */
+  async setThemePreference(preference: CmdgoThemePreference): Promise<void> {
+    await this.ensureLoaded()
+    if (this.themeMode === preference) return
+    this.themeMode = preference
+    await this.persist()
+  }
+
   /** 客户端可见的快照（不含任何凭据）。 */
-  snapshot(): { hiddenModels: string[]; hudEnabled: boolean } {
-    return { hiddenModels: [...this.hidden].sort(), hudEnabled: this.hud }
+  snapshot(): { hiddenModels: string[]; hudEnabled: boolean; theme: CmdgoThemePreference } {
+    return { hiddenModels: [...this.hidden].sort(), hudEnabled: this.hud, theme: this.themeMode }
   }
 }
