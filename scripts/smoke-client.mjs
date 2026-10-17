@@ -351,6 +351,9 @@ check('.cmdgo 锚定 color-scheme:light（否则深色宿主下原生下拉/滚�
   'CSS 里找不到 .cmdgo{…color-scheme:light…}')
 check('模型列表滚动条显式配色（不用浏览器默认灰色块）',
   consoleCss.includes('.cmdgo-models::-webkit-scrollbar-thumb'))
+check('厂家芯片横向滚动条与模型列表同色（两处并排不能有色差）',
+  /\.cmdgo-vendors::-webkit-scrollbar-thumb\{[^}]*#e5e5e5/.test(consoleCss),
+  '横向滚动条 thumb 不是 #e5e5e5')
 check('厂家下拉框接管原生外观（原生弹层在深色宿主下无法用 CSS 控制）',
   /\.cmdgo-search select\{[^}]*appearance:none/.test(consoleCss),
   'CSS 里找不到 .cmdgo-search select{…appearance:none…}')
