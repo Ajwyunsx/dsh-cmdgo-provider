@@ -38,7 +38,8 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
 | `src/protocol.ts` | 网关请求信封与 NDJSON 事件流解析（**最大也最容易出事的一块**） |
 | `src/adapter.ts` | `LlmAdapter`：流式传输、账号故障转移、历史自愈、空回合守卫 |
 | `src/index.ts` | 插件装配：settings 两代契约、供应商注册、HTTP 路由、额度 HUD 数据 |
-| `src/models.ts` | 公开目录扫描 + Go 档位两层判定 |
+| `src/models.ts` | 公开目录扫描 + Go 档位两层判定 + 官方目录的费率解析 |
+| `src/prefs.ts` | 用户偏好（模型可见性黑名单 + HUD 开关），落 `~/.dsh/cmdgo-prefs.json` |
 | `src/pool.ts` | 多账号池（round-robin / 冷却 / 收编） |
 | `src/usage.ts` / `meter.ts` / `request-stats.ts` | 额度、调用计量、缓存台账（纯只读聚合） |
 | `src/oauth.ts` | `cmd login` 的 OAuth 提取（本机回调服务器） |
