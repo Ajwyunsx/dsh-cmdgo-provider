@@ -38,7 +38,8 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
 | `src/protocol.ts` | 网关请求信封与 NDJSON 事件流解析（**最大也最容易出事的一块**） |
 | `src/adapter.ts` | `LlmAdapter`：流式传输、账号故障转移、历史自愈、空回合守卫 |
 | `src/index.ts` | 插件装配：settings 两代契约、供应商注册、HTTP 路由、额度 HUD 数据 |
-| `src/models.ts` | 公开目录扫描 + Go 档位两层判定 |
+| `src/models.ts` | 公开目录扫描 + Go 档位两层判定 + 官方目录的费率解析 |
+| `src/prefs.ts` | 用户偏好（模型可见性黑名单 + HUD 开关 + 配色方案），落 `~/.dsh/cmdgo-prefs.json` |
 | `src/pool.ts` | 多账号池（round-robin / 冷却 / 收编） |
 | `src/usage.ts` / `meter.ts` / `request-stats.ts` | 额度、调用计量、缓存台账（纯只读聚合） |
 | `src/oauth.ts` | `cmd login` 的 OAuth 提取（本机回调服务器） |
@@ -73,6 +74,14 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
    Content-Type。这套路由此前无鉴权，恶意页面能跨站触发扣额度的操作。
 9. **effect 挂在注入回调的作用域 ctx 上**（0.1.2 教训）：挂外层 ctx 时 entry 移除
    不触发 disposer，路由会变成清不掉的孤儿。
+10. **CSS 选择器必须按真实 DOM 结构写，并用渲染树验证**：`lib/client.js` 里
+    `<select>` 的样式曾经挂在 `.cmdgo-search select` 下，而 select 实际是
+    `.cmdgo-search` 的**兄弟**（同在 `.cmdgo-filter` 里）—— 整段 `appearance:none`
+    + 自绘箭头静默失效，下拉框一直是原生外观，谁都没发现。只 grep CSS 文本的
+    断言测不出这种事，`smoke-client.mjs` 现在会真实渲染一次设置页再校验结构。
+11. **改配色只许动深色块，浅色取值视为冻结**：`--cmdgo-*` 的浅色值必须与改造前
+    逐条相等（`smoke-client.mjs` 用 WCAG 相对亮度逐对校验）。深色是新增的一套，
+    每段文字对各自底色都必须过 AA。
 
 ## 版本兼容（最容易踩的坑）
 
