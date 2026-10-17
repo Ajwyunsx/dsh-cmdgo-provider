@@ -399,10 +399,14 @@ const contrast = (a, b) => {
 check('选中芯片不再用灰度填充（中性灰挨白底必然被看成更黑，已证伪四版）',
   chipBg !== undefined && contrast('#ffffff', chipBg) < 1.2,
   '背景 ' + String(chipBg) + ' 对白底 ' + (chipBg ? contrast('#ffffff', chipBg).toFixed(2) : '?'))
-check('选中芯片靠 2px 硬黑描边承载形状信号',
+check('选中芯片靠硬黑描边换色承载信号，且与未选中同粗细（防横向抖动）',
   /\.cmdgo-vchip\.on\{[^}]*border-color:#0a0a0c/.test(consoleCss)
-  && /\.cmdgo-vchip\{[^}]*border:2px solid/.test(consoleCss),
-  '未选中与选中都应是 2px（只换色不换粗细，避免横向抖动）')
+  // 未选中与选中必须同为 1px：只换色不换粗细，外框尺寸才恒定。
+  // 不写死具体像素值 —— 粗细是设计取舍（v5 用 2px、v6 回到 1px 都合理），
+  // 真正的不变量是「两边一致」。
+  && /\.cmdgo-vchip\{[^}]*border:1px solid/.test(consoleCss)
+  && !/\.cmdgo-vchip\.on\{[^}]*border:2px/.test(consoleCss),
+  '选中/未选中的描边粗细必须一致，否则切换筛选时整排芯片会抖 1px')
 check('选中芯片带对勾（0/1 的二值信号，不依赖灰度比较）',
   /\.cmdgo-vchip\.on::before\{[^}]*content:'✓'/.test(consoleCss))
 check('选中芯片文字加粗（第三层形状信号）',
